@@ -10,8 +10,260 @@ import type {
   ImportConflict,
   CameraState,
   SnapshotData,
+  ImportWarning,
+  ImportResult,
 } from '@/types/warehouse';
 import { sampleLocations, samplePickRecords } from '@/data/sampleData';
+
+const KNOWN_SNAPSHOT_FIELDS = new Set([
+  'version',
+  'exportedAt',
+  'anomalies',
+  'importConflicts',
+  'filter',
+  'thresholds',
+  'cameraState',
+  'confirmedCameraState',
+  'activeBookmarkId',
+  'activeBookmarkName',
+  'locations',
+  'pickRecords',
+  'cameraBookmarks',
+]);
+
+const REQUIRED_FIELDS = ['version', 'exportedAt', 'locations', 'pickRecords'] as const;
+
+function isValidCameraState(obj: unknown): obj is CameraState {
+  if (!obj || typeof obj !== 'object') return false;
+  const o = obj as Record<string, unknown>;
+  return (
+    Array.isArray(o.position) &&
+    o.position.length === 3 &&
+    o.position.every((n) => typeof n === 'number') &&
+    Array.isArray(o.target) &&
+    o.target.length === 3 &&
+    o.target.every((n) => typeof n === 'number')
+  );
+}
+
+function isValidCameraBookmark(obj: unknown): obj is CameraBookmark {
+  if (!obj || typeof obj !== 'object') return false;
+  const o = obj as Record<string, unknown>;
+  return (
+    typeof o.id === 'string' &&
+    typeof o.name === 'string' &&
+    Array.isArray(o.position) &&
+    o.position.length === 3 &&
+    Array.isArray(o.target) &&
+    o.target.length === 3
+  );
+}
+
+function validateAndNormalizeSnapshot(
+  data: Record<string, unknown>
+): { snapshot: SnapshotData; warnings: ImportWarning[] } {
+  const warnings: ImportWarning[] = [];
+  const version = data.version;
+
+  if (version !== 1 && version !== 2) {
+    warnings.push({
+      type: 'version_mismatch',
+      message: `快照版本 ${version} 与当前支持的版本 1/2 不匹配，尝试以兼容模式导入`,
+      details: { snapshotVersion: version, supportedVersions: [1, 2] },
+    });
+  }
+
+  for (const field of REQUIRED_FIELDS) {
+    if (!(field in data)) {
+      warnings.push({
+        type: 'missing_field',
+        message: `快照缺少必要字段: ${field}，导入可能失败`,
+        details: { field },
+      });
+    }
+  }
+
+  for (const key of Object.keys(data)) {
+    if (!KNOWN_SNAPSHOT_FIELDS.has(key)) {
+      warnings.push({
+        type: 'unknown_field',
+        message: `快照包含未知字段: ${key}，已忽略`,
+        details: { field: key },
+      });
+    }
+  }
+
+  const defaultCameraState: CameraState = { position: [22, 16, 24], target: [7.5, 4.5, 7.5] };
+  const defaultFilter: FilterState = { dateRange: null, zones: [] };
+  const defaultThresholds: ThresholdConfig = { low: 25, medium: 50, high: 75 };
+
+  let cameraState = defaultCameraState;
+  if (data.cameraState !== undefined) {
+    if (isValidCameraState(data.cameraState)) {
+      cameraState = data.cameraState as CameraState;
+    } else {
+      warnings.push({
+        type: 'missing_field',
+        message: 'cameraState 字段格式不正确，使用默认视角',
+        details: { field: 'cameraState' },
+      });
+    }
+  } else {
+    warnings.push({
+      type: 'missing_field',
+      message: '快照缺少 cameraState，使用默认视角',
+      details: { field: 'cameraState' },
+    });
+  }
+
+  let confirmedCameraState: CameraState | null = null;
+  if (data.confirmedCameraState !== undefined) {
+    if (data.confirmedCameraState === null) {
+      confirmedCameraState = null;
+    } else if (isValidCameraState(data.confirmedCameraState)) {
+      confirmedCameraState = data.confirmedCameraState as CameraState;
+    } else {
+      warnings.push({
+        type: 'missing_field',
+        message: 'confirmedCameraState 字段格式不正确，置为 null',
+        details: { field: 'confirmedCameraState' },
+      });
+    }
+  }
+
+  let activeBookmarkId: string | null = null;
+  if (data.activeBookmarkId !== undefined) {
+    if (typeof data.activeBookmarkId === 'string') {
+      activeBookmarkId = data.activeBookmarkId;
+    } else if (data.activeBookmarkId === null) {
+      activeBookmarkId = null;
+    } else {
+      warnings.push({
+        type: 'missing_field',
+        message: 'activeBookmarkId 格式不正确，置为 null',
+        details: { field: 'activeBookmarkId' },
+      });
+    }
+  }
+
+  let activeBookmarkName: string | null = null;
+  if (data.activeBookmarkName !== undefined) {
+    if (typeof data.activeBookmarkName === 'string') {
+      activeBookmarkName = data.activeBookmarkName;
+    } else if (data.activeBookmarkName === null) {
+      activeBookmarkName = null;
+    } else {
+      warnings.push({
+        type: 'missing_field',
+        message: 'activeBookmarkName 格式不正确，置为 null',
+        details: { field: 'activeBookmarkName' },
+      });
+    }
+  }
+
+  let cameraBookmarks: CameraBookmark[] = [];
+  if (data.cameraBookmarks !== undefined) {
+    if (Array.isArray(data.cameraBookmarks)) {
+      const valid: CameraBookmark[] = [];
+      const seenNames = new Map<string, number>();
+      for (let i = 0; i < data.cameraBookmarks.length; i++) {
+        const bm = data.cameraBookmarks[i];
+        if (isValidCameraBookmark(bm)) {
+          const nameCount = seenNames.get(bm.name) || 0;
+          if (nameCount > 0) {
+            warnings.push({
+              type: 'duplicate_bookmark_name',
+              message: `书签名称重复: "${bm.name}"，已自动重命名`,
+              details: { name: bm.name, index: i, newName: `${bm.name} (${nameCount + 1})` },
+            });
+            valid.push({ ...bm, name: `${bm.name} (${nameCount + 1})` });
+          } else {
+            valid.push(bm);
+          }
+          seenNames.set(bm.name, nameCount + 1);
+        } else {
+          warnings.push({
+            type: 'unknown_bookmark',
+            message: `第 ${i} 个书签格式不正确，已跳过`,
+            details: { index: i },
+          });
+        }
+      }
+      cameraBookmarks = valid;
+    } else {
+      warnings.push({
+        type: 'missing_field',
+        message: 'cameraBookmarks 格式不正确，置为空数组',
+        details: { field: 'cameraBookmarks' },
+      });
+    }
+  }
+
+  if (activeBookmarkId && cameraBookmarks.length > 0) {
+    const found = cameraBookmarks.find((b) => b.id === activeBookmarkId);
+    if (!found) {
+      warnings.push({
+        type: 'bookmark_not_found',
+        message: `快照声明的当前书签 ID "${activeBookmarkId}" 在书签列表中不存在，已清除当前书签`,
+        details: { activeBookmarkId, availableIds: cameraBookmarks.map((b) => b.id) },
+      });
+      activeBookmarkId = null;
+      activeBookmarkName = null;
+    } else if (activeBookmarkName && activeBookmarkName !== found.name) {
+      warnings.push({
+        type: 'duplicate_bookmark_name',
+        message: `快照中 activeBookmarkName "${activeBookmarkName}" 与实际书签名称 "${found.name}" 不一致，以实际为准`,
+        details: { snapshotName: activeBookmarkName, actualName: found.name },
+      });
+      activeBookmarkName = found.name;
+    } else if (!activeBookmarkName) {
+      activeBookmarkName = found.name;
+    }
+  }
+
+  const locations = Array.isArray(data.locations) ? (data.locations as Location[]) : [];
+  const pickRecords = Array.isArray(data.pickRecords) ? (data.pickRecords as PickRecord[]) : [];
+  const anomalies = Array.isArray(data.anomalies) ? (data.anomalies as Anomaly[]) : [];
+  const importConflicts = Array.isArray(data.importConflicts) ? (data.importConflicts as ImportConflict[]) : [];
+
+  let filter = defaultFilter;
+  if (data.filter && typeof data.filter === 'object') {
+    const f = data.filter as Record<string, unknown>;
+    filter = {
+      dateRange: f.dateRange as FilterState['dateRange'] ?? null,
+      zones: Array.isArray(f.zones) ? (f.zones as string[]) : [],
+    };
+  }
+
+  let thresholds = defaultThresholds;
+  if (data.thresholds && typeof data.thresholds === 'object') {
+    const t = data.thresholds as Record<string, unknown>;
+    thresholds = {
+      low: typeof t.low === 'number' ? t.low : 25,
+      medium: typeof t.medium === 'number' ? t.medium : 50,
+      high: typeof t.high === 'number' ? t.high : 75,
+    };
+  }
+
+  return {
+    snapshot: {
+      version: 2,
+      exportedAt: typeof data.exportedAt === 'string' ? data.exportedAt : new Date().toISOString(),
+      anomalies,
+      importConflicts,
+      filter,
+      thresholds,
+      cameraState,
+      confirmedCameraState,
+      activeBookmarkId,
+      activeBookmarkName,
+      locations,
+      pickRecords,
+      cameraBookmarks,
+    },
+    warnings,
+  };
+}
 
 function filterConflictingLocations(
   locations: Location[]
@@ -129,9 +381,12 @@ interface WarehouseStore {
   thresholds: ThresholdConfig;
   cameraBookmarks: CameraBookmark[];
   activeBookmark: string | null;
+  activeBookmarkName: string | null;
   hoveredLocation: string | null;
   sidebarCollapsed: boolean;
   cameraState: CameraState;
+  confirmedCameraState: CameraState | null;
+  importWarnings: ImportWarning[];
 
   setLocations: (locs: Location[]) => ImportConflict[];
   setPickRecords: (records: PickRecord[]) => void;
@@ -143,13 +398,15 @@ interface WarehouseStore {
   setHoveredLocation: (id: string | null) => void;
   setSidebarCollapsed: (v: boolean) => void;
   setCameraState: (cs: Partial<CameraState>) => void;
+  confirmCameraState: () => void;
   loadSampleData: () => void;
   exportSnapshot: () => void;
-  importSnapshot: (data: SnapshotData) => { success: boolean; error?: string };
+  importSnapshot: (data: unknown) => ImportResult;
   exportAnomalies: () => void;
   getHeatMap: () => Map<string, { count: number; color: string; opacity: number }>;
   getAvailableZones: () => string[];
   clearImportConflicts: () => void;
+  clearImportWarnings: () => void;
 }
 
 export const useWarehouseStore = create<WarehouseStore>()(
@@ -163,9 +420,12 @@ export const useWarehouseStore = create<WarehouseStore>()(
       thresholds: { low: 25, medium: 50, high: 75 },
       cameraBookmarks: [],
       activeBookmark: null,
+      activeBookmarkName: null,
       hoveredLocation: null,
       sidebarCollapsed: false,
       cameraState: { position: [22, 16, 24], target: [7.5, 4.5, 7.5] },
+      confirmedCameraState: null,
+      importWarnings: [],
 
       setLocations: (locs) => {
         const { valid, conflicts } = filterConflictingLocations(locs);
@@ -188,23 +448,52 @@ export const useWarehouseStore = create<WarehouseStore>()(
         set((state) => ({ thresholds: { ...state.thresholds, ...t } })),
 
       addBookmark: (bm) =>
-        set((state) => ({
-          cameraBookmarks: [...state.cameraBookmarks, bm],
-        })),
+        set((state) => {
+          const existing = state.cameraBookmarks.find((b) => b.id === bm.id);
+          if (existing) {
+            return { cameraBookmarks: state.cameraBookmarks };
+          }
+          const nameExists = state.cameraBookmarks.some((b) => b.name === bm.name);
+          let finalBm = bm;
+          if (nameExists) {
+            let suffix = 1;
+            while (state.cameraBookmarks.some((b) => b.name === `${bm.name} (${suffix})`)) {
+              suffix++;
+            }
+            finalBm = { ...bm, name: `${bm.name} (${suffix})` };
+          }
+          return { cameraBookmarks: [...state.cameraBookmarks, finalBm] };
+        }),
 
       removeBookmark: (id) =>
         set((state) => ({
           cameraBookmarks: state.cameraBookmarks.filter((b) => b.id !== id),
           activeBookmark: state.activeBookmark === id ? null : state.activeBookmark,
+          activeBookmarkName: state.activeBookmark === id ? null : state.activeBookmarkName,
         })),
 
-      setActiveBookmark: (id) => set({ activeBookmark: id }),
+      setActiveBookmark: (id) =>
+        set((state) => {
+          if (id === null) {
+            return { activeBookmark: null, activeBookmarkName: null };
+          }
+          const bm = state.cameraBookmarks.find((b) => b.id === id);
+          return {
+            activeBookmark: id,
+            activeBookmarkName: bm ? bm.name : state.activeBookmarkName,
+          };
+        }),
       setHoveredLocation: (id) => set({ hoveredLocation: id }),
       setSidebarCollapsed: (v) => set({ sidebarCollapsed: v }),
 
       setCameraState: (cs) =>
         set((state) => ({
           cameraState: { ...state.cameraState, ...cs },
+        })),
+
+      confirmCameraState: () =>
+        set((state) => ({
+          confirmedCameraState: { ...state.cameraState },
         })),
 
       loadSampleData: () => {
@@ -225,15 +514,16 @@ export const useWarehouseStore = create<WarehouseStore>()(
           ? state.cameraBookmarks.find((b) => b.id === state.activeBookmark)
           : null;
         const snapshot: SnapshotData = {
-          version: 1,
+          version: 2,
           exportedAt: new Date().toISOString(),
           anomalies: state.anomalies,
           importConflicts: state.importConflicts,
           filter: state.filter,
           thresholds: state.thresholds,
           cameraState: state.cameraState,
+          confirmedCameraState: state.confirmedCameraState,
           activeBookmarkId: state.activeBookmark,
-          activeBookmarkName: activeBm?.name ?? null,
+          activeBookmarkName: activeBm?.name ?? state.activeBookmarkName ?? null,
           locations: state.locations,
           pickRecords: state.pickRecords,
           cameraBookmarks: state.cameraBookmarks,
@@ -251,31 +541,97 @@ export const useWarehouseStore = create<WarehouseStore>()(
 
       importSnapshot: (data) => {
         try {
-          if (data.version !== 1) {
-            return { success: false, error: `不支持的快照版本: ${data.version}` };
-          }
-          if (!Array.isArray(data.locations) || !Array.isArray(data.pickRecords)) {
-            return { success: false, error: '快照数据缺少必要字段 (locations/pickRecords)' };
+          if (!data || typeof data !== 'object') {
+            return {
+              success: false,
+              error: '快照数据格式无效',
+              warnings: [],
+              restored: {
+                cameraState: false,
+                confirmedCameraState: false,
+                activeBookmark: false,
+                activeBookmarkName: false,
+                cameraBookmarks: false,
+                locations: false,
+                pickRecords: false,
+                filter: false,
+                thresholds: false,
+              },
+            };
           }
 
-          const { valid, conflicts } = filterConflictingLocations(data.locations);
-          const anomalies = detectAnomalies(valid, data.pickRecords);
+          const { snapshot, warnings } = validateAndNormalizeSnapshot(
+            data as Record<string, unknown>
+          );
+
+          const { valid, conflicts } = filterConflictingLocations(snapshot.locations);
+          const anomalies = detectAnomalies(valid, snapshot.pickRecords);
 
           set({
             locations: valid,
-            pickRecords: data.pickRecords,
+            pickRecords: snapshot.pickRecords,
             anomalies,
             importConflicts: conflicts,
-            filter: data.filter ?? { dateRange: null, zones: [] },
-            thresholds: data.thresholds ?? { low: 25, medium: 50, high: 75 },
-            cameraState: data.cameraState ?? { position: [22, 16, 24], target: [7.5, 4.5, 7.5] },
-            activeBookmark: data.activeBookmarkId ?? null,
-            cameraBookmarks: data.cameraBookmarks ?? [],
+            filter: snapshot.filter,
+            thresholds: snapshot.thresholds,
+            cameraState: snapshot.cameraState,
+            confirmedCameraState: snapshot.confirmedCameraState,
+            activeBookmark: snapshot.activeBookmarkId,
+            activeBookmarkName: snapshot.activeBookmarkName,
+            cameraBookmarks: snapshot.cameraBookmarks,
+            importWarnings: warnings,
           });
 
-          return { success: true };
+          const restored = {
+            cameraState: true,
+            confirmedCameraState: snapshot.confirmedCameraState !== null,
+            activeBookmark: snapshot.activeBookmarkId !== null,
+            activeBookmarkName: snapshot.activeBookmarkName !== null,
+            cameraBookmarks: snapshot.cameraBookmarks.length > 0,
+            locations: valid.length > 0,
+            pickRecords: snapshot.pickRecords.length > 0,
+            filter: snapshot.filter.dateRange !== null || snapshot.filter.zones.length > 0,
+            thresholds:
+              snapshot.thresholds.low !== 25 ||
+              snapshot.thresholds.medium !== 50 ||
+              snapshot.thresholds.high !== 75,
+          };
+
+          const logParts: string[] = ['快照导入结果:'];
+          logParts.push(`- 成功: ${true}`);
+          logParts.push(`- 警告: ${warnings.length} 条`);
+          if (warnings.length > 0) {
+            warnings.forEach((w, i) => logParts.push(`  [${i + 1}] ${w.message}`));
+          }
+          logParts.push(`- 恢复状态:`);
+          Object.entries(restored).forEach(([k, v]) => {
+            logParts.push(`  - ${k}: ${v ? '✓' : '-'}`);
+          });
+          console.info(logParts.join('\n'));
+
+          return {
+            success: true,
+            warnings,
+            restored,
+          };
         } catch (err) {
-          return { success: false, error: `快照导入失败: ${(err as Error).message}` };
+          console.error('快照导入异常:', err);
+          return {
+            success: false,
+            error: `快照导入失败: ${(err as Error).message}`,
+            warnings: [],
+            restored: {
+              cameraState: false,
+              confirmedCameraState: false,
+              activeBookmark: false,
+              activeBookmarkName: false,
+              cameraBookmarks: false,
+              locations: false,
+              pickRecords: false,
+              filter: false,
+              thresholds: false,
+            },
+          };
         }
       },
 
@@ -303,6 +659,8 @@ export const useWarehouseStore = create<WarehouseStore>()(
       },
 
       clearImportConflicts: () => set({ importConflicts: [] }),
+
+      clearImportWarnings: () => set({ importWarnings: [] }),
     }),
     {
       name: 'warehouse-heatmap-store',
@@ -315,7 +673,22 @@ export const useWarehouseStore = create<WarehouseStore>()(
         thresholds: state.thresholds,
         cameraBookmarks: state.cameraBookmarks,
         cameraState: state.cameraState,
+        confirmedCameraState: state.confirmedCameraState,
+        activeBookmark: state.activeBookmark,
+        activeBookmarkName: state.activeBookmarkName,
       }),
+      onRehydrateStorage: () => (state) => {
+        if (state?.activeBookmark && state.cameraBookmarks) {
+          const bm = state.cameraBookmarks.find((b) => b.id === state.activeBookmark);
+          if (!bm) {
+            console.warn(`[persist] 持久化的 activeBookmark "${state.activeBookmark}" 不存在，已清除`);
+            state.activeBookmark = null;
+            state.activeBookmarkName = null;
+          } else if (!state.activeBookmarkName || state.activeBookmarkName !== bm.name) {
+            state.activeBookmarkName = bm.name;
+          }
+        }
+      },
     }
   )
 );
