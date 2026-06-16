@@ -12,8 +12,12 @@ import type {
   SnapshotData,
   ImportWarning,
   ImportResult,
+  PlaybackState,
+  PlaybackLogEntry,
+  PlaybackLogLevel,
 } from '@/types/warehouse';
 import { sampleLocations, samplePickRecords } from '@/data/sampleData';
+import { getPresetById } from '@/data/demoPresets';
 
 const KNOWN_SNAPSHOT_FIELDS = new Set([
   'version',
@@ -372,6 +376,13 @@ function computeHeatMap(
   return result;
 }
 
+export function buildSnapshotExportFileName(presetId?: string | null): string {
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const timeStr = new Date().toISOString().slice(11, 19).replace(/:/g, '');
+  const presetPart = presetId ? `-${presetId}` : '';
+  return `warehouse-snapshot${presetPart}-${dateStr}-${timeStr}.json`;
+}
+
 interface WarehouseStore {
   locations: Location[];
   pickRecords: PickRecord[];
@@ -387,6 +398,7 @@ interface WarehouseStore {
   cameraState: CameraState;
   confirmedCameraState: CameraState | null;
   importWarnings: ImportWarning[];
+  playback: PlaybackState;
 
   setLocations: (locs: Location[]) => ImportConflict[];
   setPickRecords: (records: PickRecord[]) => void;
@@ -401,12 +413,15 @@ interface WarehouseStore {
   confirmCameraState: () => void;
   loadSampleData: () => void;
   exportSnapshot: () => void;
-  importSnapshot: (data: unknown) => ImportResult;
+  importSnapshot: (data: unknown, fileName?: string) => ImportResult;
   exportAnomalies: () => void;
   getHeatMap: () => Map<string, { count: number; color: string; opacity: number }>;
   getAvailableZones: () => string[];
   clearImportConflicts: () => void;
   clearImportWarnings: () => void;
+  loadDemoPreset: (presetId: string) => ImportResult | null;
+  addPlaybackLog: (level: PlaybackLogLevel, message: string, details?: Record<string, unknown>) => void;
+  clearPlaybackLogs: () => void;
 }
 
 export const useWarehouseStore = create<WarehouseStore>()(
@@ -426,6 +441,11 @@ export const useWarehouseStore = create<WarehouseStore>()(
       cameraState: { position: [22, 16, 24], target: [7.5, 4.5, 7.5] },
       confirmedCameraState: null,
       importWarnings: [],
+      playback: {
+        activePresetId: null,
+        lastSnapshotFileName: null,
+        logs: [],
+      },
 
       setLocations: (locs) => {
         const { valid, conflicts } = filterConflictingLocations(locs);
@@ -528,20 +548,27 @@ export const useWarehouseStore = create<WarehouseStore>()(
           pickRecords: state.pickRecords,
           cameraBookmarks: state.cameraBookmarks,
         };
+        const fileName = buildSnapshotExportFileName(state.playback.activePresetId);
         const blob = new Blob([JSON.stringify(snapshot, null, 2)], {
           type: 'application/json',
         });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `warehouse-snapshot-${new Date().toISOString().slice(0, 10)}.json`;
+        a.download = fileName;
         a.click();
         URL.revokeObjectURL(url);
+        get().addPlaybackLog('success', `快照已导出: ${fileName}`, { fileName });
       },
 
-      importSnapshot: (data) => {
+      importSnapshot: (data, fileName) => {
         try {
           if (!data || typeof data !== 'object') {
+            get().addPlaybackLog(
+              'error',
+              fileName ? `快照导入失败 (${fileName}): 快照数据格式无效` : '快照导入失败: 快照数据格式无效',
+              { fileName, error: '快照数据格式无效' }
+            );
             return {
               success: false,
               error: '快照数据格式无效',
@@ -609,6 +636,20 @@ export const useWarehouseStore = create<WarehouseStore>()(
           });
           console.info(logParts.join('\n'));
 
+          const restoredCount = Object.values(restored).filter(Boolean).length;
+          get().addPlaybackLog(
+            warnings.length > 0 ? 'warning' : 'success',
+            fileName
+              ? `快照导入成功 (${fileName}): 恢复 ${restoredCount}/9 项状态，${warnings.length} 条警告`
+              : `快照导入成功: 恢复 ${restoredCount}/9 项状态，${warnings.length} 条警告`,
+            { fileName, warnings: warnings.length, restored }
+          );
+          if (fileName) {
+            set((state) => ({
+              playback: { ...state.playback, lastSnapshotFileName: fileName },
+            }));
+          }
+
           return {
             success: true,
             warnings,
@@ -616,6 +657,11 @@ export const useWarehouseStore = create<WarehouseStore>()(
           };
         } catch (err) {
           console.error('快照导入异常:', err);
+          get().addPlaybackLog(
+            'error',
+            `快照导入失败: ${(err as Error).message}`,
+            { fileName, error: (err as Error).message }
+          );
           return {
             success: false,
             error: `快照导入失败: ${(err as Error).message}`,
@@ -633,6 +679,48 @@ export const useWarehouseStore = create<WarehouseStore>()(
             },
           };
         }
+      },
+
+      loadDemoPreset: (presetId) => {
+        const preset = getPresetById(presetId);
+        if (!preset) {
+          get().addPlaybackLog('error', `演示预设不存在: ${presetId}`, { presetId });
+          return null;
+        }
+        const result = get().importSnapshot(preset.snapshot, `preset:${preset.name}`);
+        if (result.success) {
+          set((state) => ({
+            playback: { ...state.playback, activePresetId: presetId },
+          }));
+          get().addPlaybackLog(
+            'info',
+            `已装载演示预设: ${preset.name}`,
+            { presetId, presetName: preset.name }
+          );
+        }
+        return result;
+      },
+
+      addPlaybackLog: (level, message, details) => {
+        const entry: PlaybackLogEntry = {
+          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          level,
+          message,
+          details,
+        };
+        set((state) => ({
+          playback: {
+            ...state.playback,
+            logs: [entry, ...state.playback.logs].slice(0, 200),
+          },
+        }));
+      },
+
+      clearPlaybackLogs: () => {
+        set((state) => ({
+          playback: { ...state.playback, logs: [] },
+        }));
       },
 
       exportAnomalies: () => {
@@ -676,6 +764,11 @@ export const useWarehouseStore = create<WarehouseStore>()(
         confirmedCameraState: state.confirmedCameraState,
         activeBookmark: state.activeBookmark,
         activeBookmarkName: state.activeBookmarkName,
+        playback: {
+          activePresetId: state.playback.activePresetId,
+          lastSnapshotFileName: state.playback.lastSnapshotFileName,
+          logs: [],
+        },
       }),
       onRehydrateStorage: () => (state) => {
         if (state?.activeBookmark && state.cameraBookmarks) {
@@ -687,6 +780,13 @@ export const useWarehouseStore = create<WarehouseStore>()(
           } else if (!state.activeBookmarkName || state.activeBookmarkName !== bm.name) {
             state.activeBookmarkName = bm.name;
           }
+        }
+        if (state && !state.playback) {
+          state.playback = {
+            activePresetId: null,
+            lastSnapshotFileName: null,
+            logs: [],
+          };
         }
       },
     }

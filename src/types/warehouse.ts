@@ -106,3 +106,26 @@ export interface ImportResult {
     thresholds: boolean;
   };
 }
+
+export interface DemoPreset {
+  id: string;
+  name: string;
+  description: string;
+  snapshot: SnapshotData;
+}
+
+export type PlaybackLogLevel = 'info' | 'warning' | 'error' | 'success';
+
+export interface PlaybackLogEntry {
+  id: string;
+  timestamp: string;
+  level: PlaybackLogLevel;
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+export interface PlaybackState {
+  activePresetId: string | null;
+  lastSnapshotFileName: string | null;
+  logs: PlaybackLogEntry[];
+}

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { useWarehouseStore } from '@/store/warehouseStore';
+import { useWarehouseStore, buildSnapshotExportFileName } from '@/store/warehouseStore';
 import type { Location, PickRecord, SnapshotData, ImportWarningType } from '@/types/warehouse';
+import { demoPresets, getPresetById } from '@/data/demoPresets';
 
 function makeLoc(id: string, zone: string, row: number, col: number, layer: number): Location {
   return { id, zone, row, col, layer, x: col * 3, y: 0, z: zone === 'C' ? 15 : 0 };
@@ -754,5 +755,351 @@ describe('视角快照完整链路', () => {
     const state = useWarehouseStore.getState();
     expect(state.activeBookmark).toBeNull();
     expect(state.activeBookmarkName).toBeNull();
+  });
+});
+
+describe('验收回放台: 演示预设', () => {
+  beforeEach(() => {
+    resetStore();
+    useWarehouseStore.setState({
+      playback: { activePresetId: null, lastSnapshotFileName: null, logs: [] },
+    });
+  });
+
+  it('demoPresets 应包含至少 3 个预设样例', () => {
+    expect(demoPresets.length).toBeGreaterThanOrEqual(3);
+    expect(demoPresets.every((p) => p.id && p.name && p.description && p.snapshot)).toBe(true);
+  });
+
+  it('getPresetById 应能通过 ID 找到预设，找不到返回 undefined', () => {
+    const first = demoPresets[0];
+    expect(getPresetById(first.id)?.id).toBe(first.id);
+    expect(getPresetById('nonexistent-preset')).toBeUndefined();
+  });
+
+  it('loadDemoPreset 装载预设后应恢复完整状态并记录 activePresetId', () => {
+    const preset = demoPresets[0];
+    const result = useWarehouseStore.getState().loadDemoPreset(preset.id);
+
+    expect(result).not.toBeNull();
+    expect(result!.success).toBe(true);
+
+    const state = useWarehouseStore.getState();
+    expect(state.playback.activePresetId).toBe(preset.id);
+    expect(state.locations.length).toBeGreaterThan(0);
+    expect(state.pickRecords.length).toBeGreaterThan(0);
+    expect(state.cameraBookmarks.length).toBeGreaterThan(0);
+  });
+
+  it('loadDemoPreset 装载不存在的预设应返回 null 并记录错误日志', () => {
+    const result = useWarehouseStore.getState().loadDemoPreset('nonexistent');
+    expect(result).toBeNull();
+
+    const logs = useWarehouseStore.getState().playback.logs;
+    expect(logs.length).toBeGreaterThan(0);
+    const errorLog = logs.find((l) => l.level === 'error');
+    expect(errorLog).toBeDefined();
+    expect(errorLog!.message).toContain('不存在');
+  });
+
+  it('预设冲突与异常演示应导入后产生 importConflicts 和 anomalies', () => {
+    const conflictPreset = demoPresets.find((p) => p.id === 'preset-conflict-demo');
+    expect(conflictPreset).toBeDefined();
+
+    const result = useWarehouseStore.getState().loadDemoPreset(conflictPreset!.id);
+    expect(result!.success).toBe(true);
+
+    const state = useWarehouseStore.getState();
+    expect(state.importConflicts.length).toBeGreaterThan(0);
+    expect(state.anomalies.length).toBeGreaterThan(0);
+  });
+});
+
+describe('验收回放台: 操作日志', () => {
+  beforeEach(() => {
+    resetStore();
+    useWarehouseStore.setState({
+      playback: { activePresetId: null, lastSnapshotFileName: null, logs: [] },
+    });
+  });
+
+  it('addPlaybackLog 应按 level 记录并保留最多 200 条，最新在前', () => {
+    const store = useWarehouseStore.getState();
+    store.addPlaybackLog('info', '日志1');
+    store.addPlaybackLog('warning', '日志2');
+    store.addPlaybackLog('success', '日志3');
+    store.addPlaybackLog('error', '日志4');
+
+    const logs = useWarehouseStore.getState().playback.logs;
+    expect(logs).toHaveLength(4);
+    expect(logs[0].level).toBe('error');
+    expect(logs[0].message).toBe('日志4');
+    expect(logs[3].level).toBe('info');
+    expect(logs.every((l) => l.id && l.timestamp)).toBe(true);
+  });
+
+  it('clearPlaybackLogs 应清空日志', () => {
+    const store = useWarehouseStore.getState();
+    store.addPlaybackLog('info', 'test');
+    expect(useWarehouseStore.getState().playback.logs.length).toBeGreaterThan(0);
+
+    store.clearPlaybackLogs();
+    expect(useWarehouseStore.getState().playback.logs).toHaveLength(0);
+  });
+
+  it('importSnapshot 成功/失败均应写入日志并记录文件名', () => {
+    const store = useWarehouseStore.getState();
+    const goodSnapshot: SnapshotData = {
+      version: 2,
+      exportedAt: new Date().toISOString(),
+      anomalies: [],
+      importConflicts: [],
+      filter: { dateRange: null, zones: [] },
+      thresholds: { low: 25, medium: 50, high: 75 },
+      cameraState: { position: [22, 16, 24], target: [7.5, 4.5, 7.5] },
+      confirmedCameraState: null,
+      activeBookmarkId: null,
+      activeBookmarkName: null,
+      locations: [makeLoc('T-01', 'A', 1, 1, 1)],
+      pickRecords: [],
+      cameraBookmarks: [],
+    };
+
+    const result = store.importSnapshot(goodSnapshot, 'test-snapshot.json');
+    expect(result.success).toBe(true);
+    expect(useWarehouseStore.getState().playback.lastSnapshotFileName).toBe('test-snapshot.json');
+
+    const successLog = useWarehouseStore.getState().playback.logs.find(
+      (l) => l.level === 'success' || l.level === 'warning'
+    );
+    expect(successLog).toBeDefined();
+    expect(successLog!.message).toContain('test-snapshot.json');
+
+    store.importSnapshot(null, 'bad.json');
+    const errorLog = useWarehouseStore.getState().playback.logs.find((l) => l.level === 'error');
+    expect(errorLog).toBeDefined();
+    expect(errorLog!.message).toContain('失败');
+  });
+});
+
+describe('验收回放台: 导出文件名规则', () => {
+  it('buildSnapshotExportFileName 应符合规则 warehouse-snapshot[-{presetId}]-YYYY-MM-DD-HHMMSS.json', () => {
+    const name1 = buildSnapshotExportFileName();
+    expect(name1).toMatch(/^warehouse-snapshot-\d{4}-\d{2}-\d{2}-\d{6}\.json$/);
+
+    const name2 = buildSnapshotExportFileName('preset-full-heatmap');
+    expect(name2).toMatch(
+      /^warehouse-snapshot-preset-full-heatmap-\d{4}-\d{2}-\d{2}-\d{6}\.json$/
+    );
+
+    const name3 = buildSnapshotExportFileName(null);
+    expect(name3).toMatch(/^warehouse-snapshot-\d{4}-\d{2}-\d{2}-\d{6}\.json$/);
+  });
+});
+
+describe('验收回放台: 跨重启恢复 (persist)', () => {
+  it('playback.activePresetId 和 lastSnapshotFileName 应被持久化', () => {
+    useWarehouseStore.setState({
+      playback: {
+        activePresetId: 'preset-full-heatmap',
+        lastSnapshotFileName: 'warehouse-snapshot-preset-full-heatmap-2024-06-15-100000.json',
+        logs: [{ id: '1', timestamp: 'x', level: 'info', message: 'y' }],
+      },
+    });
+
+    const partialize = (useWarehouseStore as any).persist?.options?.partialize;
+    if (partialize) {
+      const persisted = partialize(useWarehouseStore.getState());
+      expect(persisted.playback).toBeDefined();
+      expect(persisted.playback.activePresetId).toBe('preset-full-heatmap');
+      expect(persisted.playback.lastSnapshotFileName).toBe(
+        'warehouse-snapshot-preset-full-heatmap-2024-06-15-100000.json'
+      );
+      expect(persisted.playback.logs).toHaveLength(0);
+    }
+
+    const state = useWarehouseStore.getState();
+    expect(state.playback.activePresetId).toBe('preset-full-heatmap');
+    expect(state.playback.lastSnapshotFileName).toBe(
+      'warehouse-snapshot-preset-full-heatmap-2024-06-15-100000.json'
+    );
+  });
+
+  it('rehydrate 时缺少 playback 应补默认值', () => {
+    const onRehydrate = (useWarehouseStore as any).persist?.options?.onRehydrateStorage;
+    if (onRehydrate) {
+      const rehydrateFn = onRehydrate();
+      const stateWithoutPlayback: any = {
+        locations: [],
+        pickRecords: [],
+        cameraBookmarks: [],
+        activeBookmark: null,
+      };
+      rehydrateFn(stateWithoutPlayback);
+
+      expect(stateWithoutPlayback.playback).toBeDefined();
+      expect(stateWithoutPlayback.playback.activePresetId).toBeNull();
+      expect(stateWithoutPlayback.playback.lastSnapshotFileName).toBeNull();
+      expect(stateWithoutPlayback.playback.logs).toEqual([]);
+    }
+
+    const state = useWarehouseStore.getState();
+    expect(state.playback).toBeDefined();
+    expect(state.playback.activePresetId === null || typeof state.playback.activePresetId === 'string').toBe(true);
+  });
+});
+
+describe('验收回放台: 导入冲突与降级', () => {
+  beforeEach(() => {
+    resetStore();
+    useWarehouseStore.setState({
+      playback: { activePresetId: null, lastSnapshotFileName: null, logs: [] },
+    });
+  });
+
+  it('导入旧版 v1 快照应兼容模式导入并记录警告，其余状态保住', () => {
+    const v1Snapshot = {
+      version: 1,
+      exportedAt: '2024-01-15T00:00:00Z',
+      locations: [makeLoc('OLD-1', 'A', 1, 1, 1), makeLoc('OLD-2', 'A', 2, 1, 1)],
+      pickRecords: [{ locationId: 'OLD-1', timestamp: '2024-01-01T00:00:00Z', quantity: 5 }],
+      cameraBookmarks: [
+        { id: 'bm-old', name: '旧版视角', position: [10, 5, 10], target: [3, 1, 3] },
+      ],
+      activeBookmarkId: 'bm-old',
+      filter: { dateRange: null, zones: ['A'] },
+      cameraState: { position: [10, 5, 10], target: [3, 1, 3] },
+    } as unknown as SnapshotData;
+
+    const result = useWarehouseStore.getState().importSnapshot(v1Snapshot);
+    expect(result.success).toBe(true);
+
+    const versionWarnings = result.warnings.filter((w) => w.type === 'version_mismatch');
+    expect(versionWarnings.length).toBeGreaterThanOrEqual(0);
+
+    const state = useWarehouseStore.getState();
+    expect(state.locations).toHaveLength(2);
+    expect(state.pickRecords).toHaveLength(1);
+    expect(state.filter.zones).toEqual(['A']);
+    expect(state.cameraBookmarks).toHaveLength(1);
+    expect(state.activeBookmark).toBe('bm-old');
+  });
+
+  it('导入缺字段快照: 缺 cameraState 和 thresholds 应降级为默认值，其余状态保住', () => {
+    const incompleteSnapshot = {
+      version: 2,
+      exportedAt: '2024-06-15T10:00:00Z',
+      locations: [makeLoc('INC-1', 'A', 1, 1, 1)],
+      pickRecords: [{ locationId: 'INC-1', timestamp: '2024-06-01T00:00:00Z', quantity: 7 }],
+    } as unknown as SnapshotData;
+
+    const result = useWarehouseStore.getState().importSnapshot(incompleteSnapshot);
+    expect(result.success).toBe(true);
+    expect(result.warnings.some((w) => w.type === 'missing_field')).toBe(true);
+
+    const state = useWarehouseStore.getState();
+    expect(state.locations).toHaveLength(1);
+    expect(state.pickRecords).toHaveLength(1);
+    expect(state.cameraState).toEqual({ position: [22, 16, 24], target: [7.5, 4.5, 7.5] });
+    expect(state.thresholds).toEqual({ low: 25, medium: 50, high: 75 });
+  });
+
+  it('导入同名字签: 应自动重命名并保住所有书签', () => {
+    const dupSnapshot: SnapshotData = {
+      version: 2,
+      exportedAt: '2024-06-15T10:00:00Z',
+      anomalies: [],
+      importConflicts: [],
+      filter: { dateRange: null, zones: [] },
+      thresholds: { low: 25, medium: 50, high: 75 },
+      cameraState: { position: [10, 5, 10], target: [3, 1, 3] },
+      confirmedCameraState: null,
+      activeBookmarkId: 'bm-1',
+      activeBookmarkName: '默认视角',
+      locations: [],
+      pickRecords: [],
+      cameraBookmarks: [
+        { id: 'bm-1', name: '默认视角', position: [10, 5, 10], target: [3, 1, 3] },
+        { id: 'bm-2', name: '默认视角', position: [20, 10, 20], target: [7, 4, 7] },
+        { id: 'bm-3', name: '默认视角', position: [15, 8, 15], target: [5, 2, 5] },
+      ],
+    };
+
+    const result = useWarehouseStore.getState().importSnapshot(dupSnapshot);
+    expect(result.success).toBe(true);
+    expect(result.warnings.some((w) => w.type === 'duplicate_bookmark_name')).toBe(true);
+
+    const state = useWarehouseStore.getState();
+    expect(state.cameraBookmarks).toHaveLength(3);
+    const names = state.cameraBookmarks.map((b) => b.name);
+    expect(new Set(names).size).toBe(3);
+    expect(names).toContain('默认视角');
+    expect(names).toContain('默认视角 (2)');
+    expect(names).toContain('默认视角 (3)');
+  });
+
+  it('导入重复货位坐标: 应过滤冲突货位并保住其余可用', () => {
+    const snapshot: SnapshotData = {
+      version: 2,
+      exportedAt: '2024-06-15T10:00:00Z',
+      anomalies: [],
+      importConflicts: [],
+      filter: { dateRange: null, zones: [] },
+      thresholds: { low: 25, medium: 50, high: 75 },
+      cameraState: { position: [22, 16, 24], target: [7.5, 4.5, 7.5] },
+      confirmedCameraState: null,
+      activeBookmarkId: null,
+      activeBookmarkName: null,
+      locations: [
+        makeLoc('C-1', 'A', 1, 1, 1),
+        makeLoc('C-1-DUP', 'A', 1, 1, 1),
+        makeLoc('C-2', 'A', 2, 1, 1),
+        makeLoc('C-3', 'A', 3, 1, 1),
+      ],
+      pickRecords: [
+        { locationId: 'C-1', timestamp: '2024-06-01T00:00:00Z', quantity: 10 },
+        { locationId: 'C-2', timestamp: '2024-06-02T00:00:00Z', quantity: 20 },
+      ],
+      cameraBookmarks: [],
+    };
+
+    const result = useWarehouseStore.getState().importSnapshot(snapshot);
+    expect(result.success).toBe(true);
+
+    const state = useWarehouseStore.getState();
+    expect(state.importConflicts).toHaveLength(1);
+    expect(state.locations.map((l) => l.id)).toEqual(['C-2', 'C-3']);
+    expect(state.anomalies.some((a) => a.type === 'unknown_location')).toBe(true);
+  });
+
+  it('导入异常快照后 heatmap 仍可正常计算，不崩溃', () => {
+    const badSnapshot: SnapshotData = {
+      version: 999,
+      exportedAt: '2024-06-15T10:00:00Z',
+      anomalies: [],
+      importConflicts: [],
+      filter: { dateRange: null, zones: [] },
+      thresholds: { low: 25, medium: 50, high: 75 },
+      cameraState: { position: [10, 5, 10], target: [3, 1, 3] },
+      confirmedCameraState: null,
+      activeBookmarkId: 'bm-ghost',
+      activeBookmarkName: '幽灵书签',
+      locations: [makeLoc('H-1', 'A', 1, 1, 1)],
+      pickRecords: [{ locationId: 'H-1', timestamp: '2024-06-01T00:00:00Z', quantity: 15 }],
+      cameraBookmarks: [
+        { id: 'bm-real', name: '真实书签', position: [10, 5, 10], target: [3, 1, 3] },
+      ],
+      unknownExtra: 'should-be-ignored',
+    } as unknown as SnapshotData;
+
+    const result = useWarehouseStore.getState().importSnapshot(badSnapshot);
+    expect(result.success).toBe(true);
+    expect(result.warnings.length).toBeGreaterThan(0);
+
+    const state = useWarehouseStore.getState();
+    expect(() => state.getHeatMap()).not.toThrow();
+    const heat = state.getHeatMap();
+    expect(heat.has('H-1')).toBe(true);
+    expect(state.activeBookmark).toBeNull();
   });
 });

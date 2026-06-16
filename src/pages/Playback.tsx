@@ -1,18 +1,18 @@
 import { useEffect } from 'react';
-import Sidebar from '@/components/Sidebar';
+import PlaybackSidebar from '@/components/PlaybackSidebar';
 import Scene3D from '@/components/Scene3D';
 import TopNav from '@/components/TopNav';
 
-export default function Home() {
+export default function Playback() {
   useEffect(() => {
-    document.title = '主页 - 仓储 3D 热力图';
+    document.title = '验收回放台 - 仓储 3D 热力图';
   }, []);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#0a0f1a] flex-col">
       <TopNav />
       <div className="flex flex-1 min-h-0 pt-11">
-        <Sidebar />
+        <PlaybackSidebar />
         <div className="flex-1 relative">
           <Scene3D />
         </div>
