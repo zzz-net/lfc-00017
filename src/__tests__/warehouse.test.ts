@@ -1103,3 +1103,487 @@ describe('验收回放台: 导入冲突与降级', () => {
     expect(state.activeBookmark).toBeNull();
   });
 });
+
+function resetStoreWithArchive() {
+  useWarehouseStore.setState({
+    locations: [],
+    pickRecords: [],
+    anomalies: [],
+    importConflicts: [],
+    filter: { dateRange: null, zones: [] },
+    thresholds: { low: 25, medium: 50, high: 75 },
+    cameraState: { position: [22, 16, 24], target: [7.5, 4.5, 7.5] },
+    confirmedCameraState: null,
+    cameraBookmarks: [],
+    activeBookmark: null,
+    activeBookmarkName: null,
+    importWarnings: [],
+    playback: { activePresetId: null, lastSnapshotFileName: null, logs: [] },
+    archive: {
+      entries: [],
+      maxEntries: 30,
+      lastAutoSaveId: null,
+      undoStack: [],
+      currentImportSession: null,
+    },
+  });
+}
+
+describe('快照归档中心: 导出链路', () => {
+  beforeEach(() => {
+    resetStoreWithArchive();
+  });
+
+  it('saveToArchive 应创建归档条目，包含正确元数据 (文件名、时间、来源、schema、摘要)', () => {
+    const locs = [
+      makeLoc('T-1', 'A', 1, 1, 1),
+      makeLoc('T-2', 'B', 2, 1, 1),
+    ];
+    useWarehouseStore.getState().setLocations(locs);
+    useWarehouseStore.getState().setPickRecords([
+      { locationId: 'T-1', timestamp: '2024-06-10T08:00:00Z', quantity: 30 },
+    ]);
+    useWarehouseStore.getState().addBookmark({
+      id: 'bm-1',
+      name: '测试视角',
+      position: [10, 5, 10],
+      target: [3, 1, 3],
+    });
+    useWarehouseStore.getState().setActiveBookmark('bm-1');
+    useWarehouseStore.getState().setFilter({ dateRange: { start: '2024-06-01', end: '2024-06-30' }, zones: ['A'] });
+
+    const entry = useWarehouseStore.getState().saveToArchive('manual', 'my-snapshot.json');
+
+    expect(entry).not.toBeNull();
+    expect(entry!.fileName).toBe('my-snapshot.json');
+    expect(entry!.source).toBe('manual');
+    expect(entry!.schemaVersion).toBe(2);
+    expect(entry!.savedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(entry!.summary.locationsCount).toBe(2);
+    expect(entry!.summary.pickRecordsCount).toBe(1);
+    expect(entry!.summary.bookmarksCount).toBe(1);
+    expect(entry!.summary.activeBookmarkName).toBe('测试视角');
+    expect(entry!.summary.zones).toEqual(['A', 'B']);
+    expect(entry!.summary.hasDateFilter).toBe(true);
+    expect(['low', 'medium', 'high', 'mixed', 'none']).toContain(entry!.summary.heatmapLevel);
+
+    const state = useWarehouseStore.getState();
+    expect(state.archive.entries).toHaveLength(1);
+    expect(state.archive.entries[0].id).toBe(entry!.id);
+  });
+
+  it('同名文件归档应自动去重: name.json → name (2).json → name (3).json', () => {
+    const locs = [makeLoc('X-1', 'A', 1, 1, 1)];
+    useWarehouseStore.getState().setLocations(locs);
+
+    useWarehouseStore.getState().saveToArchive('manual', 'dup.json');
+    useWarehouseStore.getState().saveToArchive('manual', 'dup.json');
+    useWarehouseStore.getState().saveToArchive('manual', 'dup.json');
+
+    const entries = useWarehouseStore.getState().archive.entries;
+    expect(entries).toHaveLength(3);
+    const fileNames = entries.map((e) => e.fileName);
+    expect(fileNames).toContain('dup.json');
+    expect(fileNames).toContain('dup (2).json');
+    expect(fileNames).toContain('dup (3).json');
+  });
+
+  it('归档条目应按时间倒序排列，超过 maxEntries 应淘汰最旧的', () => {
+    const locs = [makeLoc('Q-1', 'A', 1, 1, 1)];
+    useWarehouseStore.getState().setLocations(locs);
+    useWarehouseStore.setState({ archive: { ...useWarehouseStore.getState().archive, maxEntries: 3 } });
+
+    const e1 = useWarehouseStore.getState().saveToArchive('manual', '1.json');
+    const e2 = useWarehouseStore.getState().saveToArchive('manual', '2.json');
+    const e3 = useWarehouseStore.getState().saveToArchive('manual', '3.json');
+    const e4 = useWarehouseStore.getState().saveToArchive('manual', '4.json');
+
+    const entries = useWarehouseStore.getState().archive.entries;
+    expect(entries).toHaveLength(3);
+    expect(entries[0].id).toBe(e4!.id);
+    expect(entries[1].id).toBe(e3!.id);
+    expect(entries[2].id).toBe(e2!.id);
+    expect(entries.some((e) => e.id === e1!.id)).toBe(false);
+  });
+});
+
+describe('快照归档中心: 导入链路 & 撤销', () => {
+  beforeEach(() => {
+    resetStoreWithArchive();
+  });
+
+  it('importSnapshotWithArchive 成功导入后应写入归档 + 撤销栈，canUndo=true', () => {
+    const snapshot: SnapshotData = {
+      version: 2,
+      exportedAt: '2024-06-15T10:00:00Z',
+      anomalies: [],
+      importConflicts: [],
+      filter: { dateRange: { start: '2024-01-01', end: '2024-12-31' }, zones: ['A', 'B'] },
+      thresholds: { low: 30, medium: 60, high: 90 },
+      cameraState: { position: [15, 10, 15], target: [5, 3, 5] },
+      confirmedCameraState: { position: [15, 10, 15], target: [5, 3, 5] },
+      activeBookmarkId: 'bm-1',
+      activeBookmarkName: '视角1',
+      locations: [makeLoc('IMP-1', 'A', 1, 1, 1), makeLoc('IMP-2', 'B', 2, 1, 1)],
+      pickRecords: [{ locationId: 'IMP-1', timestamp: '2024-06-10T00:00:00Z', quantity: 10 }],
+      cameraBookmarks: [
+        { id: 'bm-1', name: '视角1', position: [15, 10, 15], target: [5, 3, 5] },
+      ],
+    };
+
+    const result = useWarehouseStore.getState().importSnapshotWithArchive(
+      snapshot,
+      'my-import.json',
+      false
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.canUndo).toBe(true);
+    expect(result.archiveEntryId).not.toBeNull();
+    expect(result.previousStateId).not.toBeNull();
+
+    const state = useWarehouseStore.getState();
+    expect(state.archive.entries).toHaveLength(1);
+    expect(state.archive.entries[0].fileName).toBe('my-import.json');
+    expect(state.archive.entries[0].source).toBe('import');
+    expect(state.archive.entries[0].importLogs!.length).toBeGreaterThan(0);
+    expect(state.archive.undoStack).toHaveLength(1);
+    expect(state.locations.map((l) => l.id)).toEqual(['IMP-1', 'IMP-2']);
+  });
+
+  it('undoLastImport 应恢复到导入前的完整状态', () => {
+    const origLocs = [makeLoc('ORIG-1', 'A', 1, 1, 1), makeLoc('ORIG-2', 'B', 2, 1, 1)];
+    useWarehouseStore.getState().setLocations(origLocs);
+    useWarehouseStore.getState().setFilter({ zones: ['X'] });
+    useWarehouseStore.getState().setThresholds({ low: 10, medium: 20, high: 30 });
+
+    const newSnapshot: SnapshotData = {
+      version: 2,
+      exportedAt: '2024-06-15T10:00:00Z',
+      anomalies: [],
+      importConflicts: [],
+      filter: { dateRange: null, zones: ['NEW'] },
+      thresholds: { low: 90, medium: 95, high: 99 },
+      cameraState: { position: [1, 1, 1], target: [0, 0, 0] },
+      confirmedCameraState: null,
+      activeBookmarkId: null,
+      activeBookmarkName: null,
+      locations: [makeLoc('NEW-1', 'C', 3, 1, 1)],
+      pickRecords: [],
+      cameraBookmarks: [],
+    };
+
+    useWarehouseStore.getState().importSnapshotWithArchive(newSnapshot, 'new.json');
+    expect(useWarehouseStore.getState().locations.map((l) => l.id)).toEqual(['NEW-1']);
+    expect(useWarehouseStore.getState().filter.zones).toEqual(['NEW']);
+    expect(useWarehouseStore.getState().archive.undoStack).toHaveLength(1);
+
+    const undoResult = useWarehouseStore.getState().undoLastImport();
+    expect(undoResult).not.toBeNull();
+    expect(undoResult!.success).toBe(true);
+
+    const state = useWarehouseStore.getState();
+    expect(state.locations.map((l) => l.id).sort()).toEqual(['ORIG-1', 'ORIG-2']);
+    expect(state.filter.zones).toEqual(['X']);
+    expect(state.thresholds).toEqual({ low: 10, medium: 20, high: 30 });
+    expect(state.archive.undoStack).toHaveLength(0);
+  });
+
+  it('导入含旧版缺字段的快照应产生 warning 并尽量恢复', () => {
+    const oldSnapshot = {
+      version: 1,
+      exportedAt: '2024-01-01T00:00:00Z',
+      locations: [makeLoc('OLD-1', 'A', 1, 1, 1)],
+      pickRecords: [{ locationId: 'OLD-1', timestamp: '2024-01-01T00:00:00Z', quantity: 5 }],
+    };
+
+    const result = useWarehouseStore.getState().importSnapshotWithArchive(
+      oldSnapshot,
+      'old-v1.json',
+      false
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.warnings.some((w) => w.type === 'missing_field')).toBe(true);
+    expect(result.canUndo).toBe(true);
+
+    const state = useWarehouseStore.getState();
+    expect(state.locations.map((l) => l.id)).toEqual(['OLD-1']);
+    expect(state.cameraState).toEqual({ position: [22, 16, 24], target: [7.5, 4.5, 7.5] });
+    expect(state.thresholds).toEqual({ low: 25, medium: 50, high: 75 });
+    expect(state.archive.entries[0].fileName).toBe('old-v1.json');
+  });
+
+  it('mergeBookmarks=true 应合并现有与导入书签，重名自动重命名，重复 ID 跳过', () => {
+    useWarehouseStore.getState().addBookmark({
+      id: 'bm-existing',
+      name: '现有书签',
+      position: [9, 9, 9],
+      target: [1, 1, 1],
+    });
+    useWarehouseStore.getState().addBookmark({
+      id: 'bm-existing-name',
+      name: '重名书签',
+      position: [8, 8, 8],
+      target: [2, 2, 2],
+    });
+
+    const newSnapshot: SnapshotData = {
+      version: 2,
+      exportedAt: '2024-06-15T10:00:00Z',
+      anomalies: [],
+      importConflicts: [],
+      filter: { dateRange: null, zones: [] },
+      thresholds: { low: 25, medium: 50, high: 75 },
+      cameraState: { position: [22, 16, 24], target: [7.5, 4.5, 7.5] },
+      confirmedCameraState: null,
+      activeBookmarkId: 'bm-new-active',
+      activeBookmarkName: '新增激活',
+      locations: [makeLoc('M-1', 'A', 1, 1, 1)],
+      pickRecords: [],
+      cameraBookmarks: [
+        { id: 'bm-existing', name: '应该被跳过', position: [0, 0, 0], target: [0, 0, 0] },
+        { id: 'bm-new-dup-name', name: '重名书签', position: [7, 7, 7], target: [3, 3, 3] },
+        { id: 'bm-new-active', name: '新增激活', position: [6, 6, 6], target: [4, 4, 4] },
+      ],
+    };
+
+    const result = useWarehouseStore.getState().importSnapshotWithArchive(newSnapshot, 'merge.json', true);
+
+    expect(result.success).toBe(true);
+    expect(result.warnings.some((w) => w.type === 'duplicate_bookmark_name')).toBe(true);
+
+    const state = useWarehouseStore.getState();
+    const names = state.cameraBookmarks.map((b) => b.name);
+    expect(names).toContain('现有书签');
+    expect(names).toContain('重名书签');
+    expect(names).toContain('重名书签 (2)');
+    expect(names).toContain('新增激活');
+    expect(state.cameraBookmarks).toHaveLength(4);
+
+    const existing = state.cameraBookmarks.find((b) => b.id === 'bm-existing');
+    expect(existing!.position).toEqual([9, 9, 9]);
+
+    expect(state.activeBookmark).toBe('bm-new-active');
+    expect(state.activeBookmarkName).toBe('新增激活');
+  });
+
+  it('导入格式错误的数据应返回 success=false, canUndo=false，状态不变', () => {
+    const locsBefore = [makeLoc('SAFE-1', 'A', 1, 1, 1)];
+    useWarehouseStore.getState().setLocations(locsBefore);
+
+    const result = useWarehouseStore.getState().importSnapshotWithArchive(null, 'bad.json');
+    expect(result.success).toBe(false);
+    expect(result.canUndo).toBe(false);
+    expect(result.archiveEntryId).toBeNull();
+    expect(useWarehouseStore.getState().locations.map((l) => l.id)).toEqual(['SAFE-1']);
+    expect(useWarehouseStore.getState().archive.entries).toHaveLength(0);
+    expect(useWarehouseStore.getState().archive.undoStack).toHaveLength(0);
+  });
+});
+
+describe('快照归档中心: 恢复回放', () => {
+  beforeEach(() => {
+    resetStoreWithArchive();
+  });
+
+  it('restoreFromArchive 应完整恢复 9 项状态并入撤销栈', () => {
+    const locs = [makeLoc('R-1', 'A', 1, 1, 1), makeLoc('R-2', 'B', 2, 1, 1)];
+    useWarehouseStore.getState().setLocations(locs);
+    useWarehouseStore.getState().setFilter({ zones: ['A', 'B'] });
+    useWarehouseStore.getState().setThresholds({ low: 11, medium: 22, high: 33 });
+    useWarehouseStore.getState().setCameraState({ position: [5, 5, 5], target: [1, 1, 1] });
+    useWarehouseStore.getState().confirmCameraState();
+    useWarehouseStore.getState().addBookmark({
+      id: 'bm-r',
+      name: 'R视角',
+      position: [5, 5, 5],
+      target: [1, 1, 1],
+    });
+    useWarehouseStore.getState().setActiveBookmark('bm-r');
+
+    const entry = useWarehouseStore.getState().saveToArchive('manual', 'restore-me.json');
+    const entryId = entry!.id;
+
+    resetStoreWithArchive();
+    useWarehouseStore.setState({
+      archive: {
+        entries: [entry!],
+        maxEntries: 30,
+        lastAutoSaveId: null,
+        undoStack: [],
+        currentImportSession: null,
+      },
+    });
+
+    const result = useWarehouseStore.getState().restoreFromArchive(entryId);
+    expect(result.success).toBe(true);
+    expect(result.canUndo).toBe(true);
+
+    const state = useWarehouseStore.getState();
+    expect(state.locations.map((l) => l.id).sort()).toEqual(['R-1', 'R-2']);
+    expect(state.filter.zones).toEqual(['A', 'B']);
+    expect(state.thresholds).toEqual({ low: 11, medium: 22, high: 33 });
+    expect(state.cameraState).toEqual({ position: [5, 5, 5], target: [1, 1, 1] });
+    expect(state.confirmedCameraState).toEqual({ position: [5, 5, 5], target: [1, 1, 1] });
+    expect(state.activeBookmark).toBe('bm-r');
+    expect(state.activeBookmarkName).toBe('R视角');
+    expect(state.cameraBookmarks).toHaveLength(1);
+    expect(state.archive.undoStack).toHaveLength(1);
+  });
+
+  it('getLatestArchiveEntry 应返回最近条目，空归档返回 null', () => {
+    expect(useWarehouseStore.getState().getLatestArchiveEntry()).toBeNull();
+
+    const locs = [makeLoc('L-1', 'A', 1, 1, 1)];
+    useWarehouseStore.getState().setLocations(locs);
+    useWarehouseStore.getState().saveToArchive('manual', 'a.json');
+    const e2 = useWarehouseStore.getState().saveToArchive('manual', 'b.json');
+
+    expect(useWarehouseStore.getState().getLatestArchiveEntry()!.id).toBe(e2!.id);
+  });
+
+  it('deleteArchiveEntry 应删除指定条目，清空 lastAutoSaveId 若匹配', () => {
+    const locs = [makeLoc('D-1', 'A', 1, 1, 1)];
+    useWarehouseStore.getState().setLocations(locs);
+    const e1 = useWarehouseStore.getState().saveToArchive('auto-save', 'auto.json');
+    const e2 = useWarehouseStore.getState().saveToArchive('manual', 'm.json');
+    expect(useWarehouseStore.getState().archive.lastAutoSaveId).toBe(e1!.id);
+
+    const r1 = useWarehouseStore.getState().deleteArchiveEntry(e1!.id);
+    expect(r1).toBe(true);
+    expect(useWarehouseStore.getState().archive.entries.map((e) => e.id)).toEqual([e2!.id]);
+    expect(useWarehouseStore.getState().archive.lastAutoSaveId).toBeNull();
+
+    const r2 = useWarehouseStore.getState().deleteArchiveEntry('nonexistent');
+    expect(r2).toBe(false);
+  });
+
+  it('clearArchive 应清空所有条目和 lastAutoSaveId，撤销栈保留', () => {
+    const locs = [makeLoc('C-1', 'A', 1, 1, 1)];
+    useWarehouseStore.getState().setLocations(locs);
+    useWarehouseStore.getState().saveToArchive('auto-save', 'a.json');
+    useWarehouseStore.setState({
+      archive: {
+        ...useWarehouseStore.getState().archive,
+        undoStack: [{ stateId: 'x', snapshot: {} as any, createdAt: new Date().toISOString() }],
+      },
+    });
+
+    useWarehouseStore.getState().clearArchive();
+    expect(useWarehouseStore.getState().archive.entries).toHaveLength(0);
+    expect(useWarehouseStore.getState().archive.lastAutoSaveId).toBeNull();
+    expect(useWarehouseStore.getState().archive.undoStack).toHaveLength(1);
+  });
+});
+
+describe('快照归档中心: 刷新恢复 & 失败降级', () => {
+  beforeEach(() => {
+    resetStoreWithArchive();
+  });
+
+  it('restoreLatestOnStartup 空状态时应恢复最近归档', () => {
+    const locs = [makeLoc('S-1', 'A', 1, 1, 1)];
+    useWarehouseStore.getState().setLocations(locs);
+    const entry = useWarehouseStore.getState().saveToArchive('manual', 'startup.json');
+    expect(entry).not.toBeNull();
+
+    resetStoreWithArchive();
+    useWarehouseStore.setState({
+      archive: {
+        entries: [entry!],
+        maxEntries: 30,
+        lastAutoSaveId: null,
+        undoStack: [],
+        currentImportSession: null,
+      },
+    });
+
+    const result = useWarehouseStore.getState().restoreLatestOnStartup();
+    expect(result).not.toBeNull();
+    expect(result!.success).toBe(true);
+    expect(useWarehouseStore.getState().locations.map((l) => l.id)).toEqual(['S-1']);
+  });
+
+  it('restoreLatestOnStartup 已有数据时不应覆盖', () => {
+    const locs = [makeLoc('EXIST-1', 'A', 1, 1, 1)];
+    useWarehouseStore.getState().setLocations(locs);
+    useWarehouseStore.getState().setPickRecords([
+      { locationId: 'EXIST-1', timestamp: '2024-06-10T00:00:00Z', quantity: 1 },
+    ]);
+    useWarehouseStore.getState().saveToArchive('manual', 'archived.json');
+    useWarehouseStore.getState().setLocations([makeLoc('NEW-1', 'B', 1, 1, 1)]);
+
+    const result = useWarehouseStore.getState().restoreLatestOnStartup();
+    expect(result).toBeNull();
+    expect(useWarehouseStore.getState().locations.map((l) => l.id)).toEqual(['NEW-1']);
+  });
+
+  it('restoreLatestOnStartup 空归档应返回 null', () => {
+    expect(useWarehouseStore.getState().restoreLatestOnStartup()).toBeNull();
+  });
+
+  it('archive persist 应正确持久化 entries/maxEntries/lastAutoSaveId/undoStack，排除 currentImportSession', () => {
+    useWarehouseStore.setState({
+      archive: {
+        entries: [{ id: 'x', fileName: 'f.json', savedAt: 't', source: 'manual', schemaVersion: 2, summary: {} as any, snapshot: {} as any }],
+        maxEntries: 25,
+        lastAutoSaveId: 'x',
+        undoStack: [{ stateId: 'u', snapshot: {} as any, createdAt: 't' }],
+        currentImportSession: { previousEntryId: 'p', importLogs: [] },
+      },
+    });
+
+    const fullState = useWarehouseStore.getState() as unknown as Record<string, unknown>;
+    const archiveState = fullState.archive as SnapshotArchiveState;
+
+    expect(archiveState.entries).toHaveLength(1);
+    expect(archiveState.maxEntries).toBe(25);
+    expect(archiveState.lastAutoSaveId).toBe('x');
+    expect(archiveState.undoStack).toHaveLength(1);
+
+    const initialCurrentSession = archiveState.currentImportSession;
+    expect(initialCurrentSession).toBeDefined();
+
+    const statePlain = JSON.parse(JSON.stringify(fullState));
+    expect(statePlain.archive.entries).toHaveLength(1);
+    expect(statePlain.archive.maxEntries).toBe(25);
+    expect(statePlain.archive.lastAutoSaveId).toBe('x');
+    expect(statePlain.archive.undoStack).toHaveLength(1);
+  });
+
+  it('撤销栈为空时 undoLastImport 返回 null 且不抛错', () => {
+    expect(useWarehouseStore.getState().archive.undoStack).toHaveLength(0);
+    expect(useWarehouseStore.getState().undoLastImport()).toBeNull();
+  });
+
+  it('restoreFromArchive 无效 entryId 返回 success=false 且 canUndo=false', () => {
+    const result = useWarehouseStore.getState().restoreFromArchive('does-not-exist');
+    expect(result.success).toBe(false);
+    expect(result.canUndo).toBe(false);
+    expect(result.error).toBeDefined();
+  });
+
+  it('getUndoStackSize / getArchiveEntries / clearUndoStack 工作正常', () => {
+    expect(useWarehouseStore.getState().getUndoStackSize()).toBe(0);
+    expect(useWarehouseStore.getState().getArchiveEntries()).toHaveLength(0);
+
+    const locs = [makeLoc('U-1', 'A', 1, 1, 1)];
+    useWarehouseStore.getState().setLocations(locs);
+    useWarehouseStore.getState().saveToArchive('manual', 'u.json');
+    const snap: SnapshotData = {
+      version: 2, exportedAt: 't', anomalies: [], importConflicts: [],
+      filter: { dateRange: null, zones: [] }, thresholds: { low: 25, medium: 50, high: 75 },
+      cameraState: { position: [1, 1, 1], target: [0, 0, 0] }, confirmedCameraState: null,
+      activeBookmarkId: null, activeBookmarkName: null,
+      locations: [makeLoc('U-2', 'B', 1, 1, 1)], pickRecords: [], cameraBookmarks: [],
+    };
+    useWarehouseStore.getState().importSnapshotWithArchive(snap, 'u2.json');
+
+    expect(useWarehouseStore.getState().getUndoStackSize()).toBe(1);
+    expect(useWarehouseStore.getState().getArchiveEntries()).toHaveLength(2);
+
+    useWarehouseStore.getState().clearUndoStack();
+    expect(useWarehouseStore.getState().getUndoStackSize()).toBe(0);
+  });
+});

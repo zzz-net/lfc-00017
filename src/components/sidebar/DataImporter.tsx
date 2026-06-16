@@ -7,7 +7,7 @@ export default function DataImporter() {
   const layoutInputRef = useRef<HTMLInputElement>(null);
   const picksInputRef = useRef<HTMLInputElement>(null);
   const snapshotInputRef = useRef<HTMLInputElement>(null);
-  const { setLocations, setPickRecords, loadSampleData, importSnapshot, importConflicts, importWarnings, clearImportConflicts, clearImportWarnings } = useWarehouseStore();
+  const { setLocations, setPickRecords, loadSampleData, importSnapshotWithArchive, importConflicts, importWarnings, clearImportConflicts, clearImportWarnings } = useWarehouseStore();
 
   const [importError, setImportError] = useState<string | null>(null);
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
@@ -69,7 +69,7 @@ export default function DataImporter() {
         setImportSuccess(null);
         setShowWarnings(false);
         const data = JSON.parse(ev.target?.result as string);
-        const result = importSnapshot(data);
+        const result = importSnapshotWithArchive(data, file.name, false);
         if (!result.success) {
           setImportError(result.error ?? '快照导入失败');
         } else {
@@ -83,6 +83,9 @@ export default function DataImporter() {
           }
           if (importConflicts.length > 0) {
             parts.push(`${importConflicts.length} 处坐标冲突已过滤`);
+          }
+          if (result.canUndo) {
+            parts.push('可撤销');
           }
 
           setImportSuccess(parts.join('，'));

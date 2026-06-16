@@ -2,11 +2,21 @@ import { useEffect } from 'react';
 import Sidebar from '@/components/Sidebar';
 import Scene3D from '@/components/Scene3D';
 import TopNav from '@/components/TopNav';
+import { useWarehouseStore } from '@/store/warehouseStore';
 
 export default function Home() {
+  const restoreLatestOnStartup = useWarehouseStore((s) => s.restoreLatestOnStartup);
+
   useEffect(() => {
     document.title = '主页 - 仓储 3D 热力图';
   }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      restoreLatestOnStartup();
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [restoreLatestOnStartup]);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#0a0f1a] flex-col">

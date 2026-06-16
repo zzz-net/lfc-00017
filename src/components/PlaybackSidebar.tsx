@@ -6,6 +6,7 @@ import ThresholdPanel from './sidebar/ThresholdPanel';
 import BookmarkPanel from './sidebar/BookmarkPanel';
 import AnomalyPanel from './sidebar/AnomalyPanel';
 import PlaybackLog from './sidebar/PlaybackLog';
+import SnapshotArchive from './sidebar/SnapshotArchive';
 import { useWarehouseStore } from '@/store/warehouseStore';
 
 export default function PlaybackSidebar() {
@@ -81,6 +82,9 @@ export default function PlaybackSidebar() {
 
             <div className="h-px bg-[#2a3a4e]" />
             <PlaybackLog />
+
+            <div className="h-px bg-[#2a3a4e]" />
+            <SnapshotArchive />
 
             {locations.length > 0 && (
               <>

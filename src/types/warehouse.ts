@@ -129,3 +129,45 @@ export interface PlaybackState {
   lastSnapshotFileName: string | null;
   logs: PlaybackLogEntry[];
 }
+
+export type SnapshotSource = 'export' | 'import' | 'auto-save' | 'preset' | 'manual';
+
+export interface SnapshotArchiveEntry {
+  id: string;
+  fileName: string;
+  savedAt: string;
+  source: SnapshotSource;
+  schemaVersion: number;
+  summary: {
+    locationsCount: number;
+    pickRecordsCount: number;
+    bookmarksCount: number;
+    activeBookmarkName: string | null;
+    zones: string[];
+    hasDateFilter: boolean;
+    heatmapLevel: 'none' | 'low' | 'medium' | 'high' | 'mixed';
+  };
+  snapshot: SnapshotData;
+  importLogs?: PlaybackLogEntry[];
+}
+
+export interface ArchiveImportResult extends ImportResult {
+  archiveEntryId: string | null;
+  previousStateId: string | null;
+  canUndo: boolean;
+}
+
+export interface SnapshotArchiveState {
+  entries: SnapshotArchiveEntry[];
+  maxEntries: number;
+  lastAutoSaveId: string | null;
+  undoStack: Array<{
+    stateId: string;
+    snapshot: SnapshotArchiveEntry;
+    createdAt: string;
+  }>;
+  currentImportSession: {
+    previousEntryId: string | null;
+    importLogs: PlaybackLogEntry[];
+  } | null;
+}
