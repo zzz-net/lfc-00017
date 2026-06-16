@@ -280,30 +280,35 @@ src/
 ├── components/
 │   ├── TopNav.tsx                  # 顶部导航（显示 pageId、文件名规则）
 │   ├── PlaybackSidebar.tsx         # 验收回放台专用侧边栏
-│   ├── Sidebar.tsx                 # 主页侧边栏
+│   ├── Sidebar.tsx                 # 主页侧边栏（集成拥堵推演台）
 │   ├── Scene3D.tsx                 # 3D 场景容器
 │   └── sidebar/
 │       ├── DemoPresets.tsx         # 演示预设装载面板
 │       ├── PlaybackLog.tsx         # 导入/操作日志面板
-│       ├── SnapshotArchive.tsx     # 快照归档中心面板（新增）
-│       ├── ReplenishmentSandbox.tsx # 补货任务沙盘面板（新增）
+│       ├── SnapshotArchive.tsx     # 快照归档中心面板
+│       ├── ReplenishmentSandbox.tsx # 补货任务沙盘面板
+│       ├── CongestionSandbox.tsx   # 作业拥堵推演台面板（新增）
 │       ├── DataImporter.tsx        # 数据导入（布局/拣货/快照）
 │       ├── BookmarkPanel.tsx       # 相机书签管理
 │       ├── FilterPanel.tsx         # 筛选条件
 │       ├── ThresholdPanel.tsx      # 色阶阈值
 │       └── AnomalyPanel.tsx        # 异常检测结果
 ├── 3d/
-│   └── LocationBox.tsx             # 3D 货位交互（含圈选/占用颜色编码）
+│   ├── WarehouseScene.tsx          # 3D 主场景（集成拥堵覆盖层）
+│   ├── ShelfGroup.tsx              # 货架分组渲染
+│   ├── CongestionOverlay.tsx       # 拥堵覆盖层：热区/路线/货位（新增）
+│   └── LocationBox.tsx             # 3D 货位交互
 ├── pages/
-│   ├── Home.tsx                    # 主页 (pageId: home，含启动自动恢复)
-│   └── Playback.tsx                # 验收回放台 (pageId: playback，含启动自动恢复)
+│   ├── Home.tsx                    # 主页 (pageId: home，含启动自动恢复拥堵草稿)
+│   └── Playback.tsx                # 验收回放台 (pageId: playback)
 ├── store/
-│   └── warehouseStore.ts           # Zustand 状态管理（含 persist、归档、撤销）
+│   └── warehouseStore.ts           # Zustand 状态管理（含 persist、拥堵、撤销）
 ├── data/
 │   ├── sampleData.ts               # 简单样例数据
 │   └── demoPresets.ts              # 3 套验收演示预设
 ├── types/
-│   └── warehouse.ts                # 类型定义（含 SnapshotArchiveEntry 等）
+│   └── warehouse.ts                # 类型定义（含 CongestionPlan 等）
 └── __tests__/
-    └── warehouse.test.ts           # 自动化测试用例
+    ├── warehouse.test.ts           # 原自动化测试（102 用例）
+    └── congestion.test.ts          # 拥堵推演台测试（28 用例，新增）
 ```
