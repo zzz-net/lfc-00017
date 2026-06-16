@@ -11,6 +11,8 @@ export default function Sidebar() {
   const setSidebarCollapsed = useWarehouseStore((s) => s.setSidebarCollapsed);
   const locations = useWarehouseStore((s) => s.locations);
   const pickRecords = useWarehouseStore((s) => s.pickRecords);
+  const importConflicts = useWarehouseStore((s) => s.importConflicts);
+  const totalRejected = importConflicts.reduce((s, c) => s + c.rejectedIds.length, 0);
 
   return (
     <div
@@ -62,7 +64,10 @@ export default function Sidebar() {
               <>
                 <div className="h-px bg-[#2a3a4e]" />
                 <div className="text-[10px] text-gray-600 space-y-0.5">
-                  <p>货位: {locations.length} | 拣货记录: {pickRecords.length}</p>
+                  <p>有效货位: {locations.length} | 拣货记录: {pickRecords.length}</p>
+                  {totalRejected > 0 && (
+                    <p className="text-red-400">已拒绝冲突货位: {totalRejected}</p>
+                  )}
                   <p>区域: {[...new Set(locations.map((l) => l.zone))].join(', ')}</p>
                 </div>
               </>

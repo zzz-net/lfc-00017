@@ -12,10 +12,6 @@ export default function ShelfGroup() {
     () => useWarehouseStore.getState().getHeatMap(),
     [locations, filter, thresholds]
   );
-  const conflictingIds = useMemo(
-    () => useWarehouseStore.getState().getConflictingIds(),
-    [locations]
-  );
 
   const visibleLocations = useMemo(() => {
     if (filter.zones.length === 0) return locations;
@@ -96,7 +92,6 @@ export default function ShelfGroup() {
             z={loc.z}
             color={heat.color}
             opacity={heat.opacity}
-            isConflict={conflictingIds.has(loc.id)}
           />
         );
       })}

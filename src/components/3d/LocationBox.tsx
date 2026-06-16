@@ -10,10 +10,9 @@ interface LocationBoxProps {
   z: number;
   color: string;
   opacity: number;
-  isConflict: boolean;
 }
 
-export default function LocationBox({ id, x, y, z, color, opacity, isConflict }: LocationBoxProps) {
+export default function LocationBox({ id, x, y, z, color, opacity }: LocationBoxProps) {
   const meshRef = useRef<THREE.Mesh>(null);
   const [hovered, setHovered] = useState(false);
   const { setHoveredLocation } = useWarehouseStore();
@@ -38,8 +37,7 @@ export default function LocationBox({ id, x, y, z, color, opacity, isConflict }:
     targetScale.current.set(1, 1, 1);
   };
 
-  const finalOpacity = isConflict ? Math.min(opacity, 0.6) : opacity;
-  const isTransparent = isConflict || opacity < 0.9;
+  const isTransparent = opacity < 0.9;
 
   return (
     <mesh
@@ -52,18 +50,12 @@ export default function LocationBox({ id, x, y, z, color, opacity, isConflict }:
       <meshBasicMaterial
         color={color}
         transparent={isTransparent}
-        opacity={finalOpacity}
+        opacity={opacity}
       />
       <lineSegments>
         <edgesGeometry args={[new THREE.BoxGeometry(3.05, 2.65, 3.05)]} />
         <lineBasicMaterial color="#ffffff" transparent opacity={0.25} />
       </lineSegments>
-      {isConflict && (
-        <lineSegments>
-          <edgesGeometry args={[new THREE.BoxGeometry(3.2, 2.8, 3.2)]} />
-          <lineBasicMaterial color="#f59e0b" />
-        </lineSegments>
-      )}
     </mesh>
   );
 }

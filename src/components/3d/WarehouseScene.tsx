@@ -12,8 +12,27 @@ function CameraController() {
   const activeBookmark = useWarehouseStore((s) => s.activeBookmark);
   const cameraBookmarks = useWarehouseStore((s) => s.cameraBookmarks);
   const setActiveBookmark = useWarehouseStore((s) => s.setActiveBookmark);
+  const cameraState = useWarehouseStore((s) => s.cameraState);
+  const setCameraState = useWarehouseStore((s) => s.setCameraState);
   const targetRef = useRef<THREE.Vector3 | null>(null);
   const animating = useRef(false);
+  const initialized = useRef(false);
+
+  useEffect(() => {
+    if (controlsRef.current) {
+      window.__warehouseOrbitControls = controlsRef.current;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!initialized.current && controlsRef.current) {
+      initialized.current = true;
+      const controls = controlsRef.current;
+      controls.target.set(...cameraState.target);
+      camera.position.set(...cameraState.position);
+      controls.update();
+    }
+  }, [cameraState, camera]);
 
   useEffect(() => {
     if (activeBookmark) {
@@ -42,12 +61,22 @@ function CameraController() {
     <OrbitControls
       ref={controlsRef}
       makeDefault
-      target={[7.5, 4.5, 7.5]}
+      target={cameraState.target as any}
       minDistance={5}
       maxDistance={80}
       maxPolarAngle={Math.PI / 2.1}
       enableDamping
       dampingFactor={0.08}
+      onChange={() => {
+        if (controlsRef.current && !animating.current) {
+          const t = controlsRef.current.target;
+          const p = camera.position;
+          setCameraState({
+            position: [p.x, p.y, p.z],
+            target: [t.x, t.y, t.z],
+          });
+        }
+      }}
     />
   );
 }

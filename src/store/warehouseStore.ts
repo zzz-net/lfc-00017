@@ -7,8 +7,42 @@ import type {
   CameraBookmark,
   ThresholdConfig,
   FilterState,
+  ImportConflict,
+  CameraState,
+  SnapshotData,
 } from '@/types/warehouse';
 import { sampleLocations, samplePickRecords } from '@/data/sampleData';
+
+function filterConflictingLocations(
+  locations: Location[]
+): { valid: Location[]; conflicts: ImportConflict[] } {
+  const coordMap = new Map<string, Location[]>();
+  for (const loc of locations) {
+    const key = `${loc.zone}:${loc.row}:${loc.col}:${loc.layer}`;
+    if (!coordMap.has(key)) coordMap.set(key, []);
+    coordMap.get(key)!.push(loc);
+  }
+
+  const conflictingIds = new Set<string>();
+  const conflicts: ImportConflict[] = [];
+
+  for (const [key, locs] of coordMap) {
+    if (locs.length > 1) {
+      const row = locs[0].row;
+      const ids = locs.map((l) => l.id);
+      ids.forEach((id) => conflictingIds.add(id));
+      conflicts.push({
+        row,
+        coordinateKey: key,
+        rejectedIds: ids,
+        message: `行 ${row} 坐标 ${key} 冲突: ${ids.length} 个货位 (${ids.join(', ')}) 共享同一位置，已全部拒绝`,
+      });
+    }
+  }
+
+  const valid = locations.filter((l) => !conflictingIds.has(l.id));
+  return { valid, conflicts };
+}
 
 function detectAnomalies(
   locations: Location[],
@@ -16,33 +50,6 @@ function detectAnomalies(
 ): Anomaly[] {
   const anomalies: Anomaly[] = [];
   const locationIds = new Set(locations.map((l) => l.id));
-
-  const conflictMap = new Map<string, Location[]>();
-  for (const loc of locations) {
-    const key = `${loc.zone}:${loc.row}:${loc.col}:${loc.layer}`;
-    if (!conflictMap.has(key)) conflictMap.set(key, []);
-    conflictMap.get(key)!.push(loc);
-  }
-
-  const rowConflicts = new Map<number, string[]>();
-  for (const [key, locs] of conflictMap) {
-    if (locs.length > 1) {
-      const row = locs[0].row;
-      const ids = locs.map((l) => l.id);
-      if (!rowConflicts.has(row)) rowConflicts.set(row, []);
-      rowConflicts.get(row)!.push(...ids);
-    }
-  }
-
-  for (const [row, ids] of rowConflicts) {
-    const uniqueIds = [...new Set(ids)];
-    anomalies.push({
-      type: 'coordinate_conflict',
-      row,
-      locationIds: uniqueIds,
-      message: `行 ${row} 坐标冲突: 存在 ${uniqueIds.length} 个坐标重叠的货位 (${uniqueIds.join(', ')})`,
-    });
-  }
 
   for (const rec of pickRecords) {
     if (!locationIds.has(rec.locationId)) {
@@ -60,22 +67,6 @@ function detectAnomalies(
   }
 
   return anomalies;
-}
-
-function getConflictingIds(locations: Location[]): Set<string> {
-  const conflictMap = new Map<string, string[]>();
-  for (const loc of locations) {
-    const key = `${loc.zone}:${loc.row}:${loc.col}:${loc.layer}`;
-    if (!conflictMap.has(key)) conflictMap.set(key, []);
-    conflictMap.get(key)!.push(loc.id);
-  }
-  const ids = new Set<string>();
-  for (const [, idList] of conflictMap) {
-    if (idList.length > 1) {
-      idList.forEach((id) => ids.add(id));
-    }
-  }
-  return ids;
 }
 
 function computeHeatMap(
@@ -133,14 +124,16 @@ interface WarehouseStore {
   locations: Location[];
   pickRecords: PickRecord[];
   anomalies: Anomaly[];
+  importConflicts: ImportConflict[];
   filter: FilterState;
   thresholds: ThresholdConfig;
   cameraBookmarks: CameraBookmark[];
   activeBookmark: string | null;
   hoveredLocation: string | null;
   sidebarCollapsed: boolean;
+  cameraState: CameraState;
 
-  setLocations: (locs: Location[]) => void;
+  setLocations: (locs: Location[]) => ImportConflict[];
   setPickRecords: (records: PickRecord[]) => void;
   setFilter: (f: Partial<FilterState>) => void;
   setThresholds: (t: Partial<ThresholdConfig>) => void;
@@ -149,11 +142,14 @@ interface WarehouseStore {
   setActiveBookmark: (id: string | null) => void;
   setHoveredLocation: (id: string | null) => void;
   setSidebarCollapsed: (v: boolean) => void;
+  setCameraState: (cs: Partial<CameraState>) => void;
   loadSampleData: () => void;
+  exportSnapshot: () => void;
+  importSnapshot: (data: SnapshotData) => { success: boolean; error?: string };
   exportAnomalies: () => void;
   getHeatMap: () => Map<string, { count: number; color: string; opacity: number }>;
-  getConflictingIds: () => Set<string>;
   getAvailableZones: () => string[];
+  clearImportConflicts: () => void;
 }
 
 export const useWarehouseStore = create<WarehouseStore>()(
@@ -162,17 +158,21 @@ export const useWarehouseStore = create<WarehouseStore>()(
       locations: [],
       pickRecords: [],
       anomalies: [],
+      importConflicts: [],
       filter: { dateRange: null, zones: [] },
       thresholds: { low: 25, medium: 50, high: 75 },
       cameraBookmarks: [],
       activeBookmark: null,
       hoveredLocation: null,
       sidebarCollapsed: false,
+      cameraState: { position: [22, 16, 24], target: [7.5, 4.5, 7.5] },
 
       setLocations: (locs) => {
+        const { valid, conflicts } = filterConflictingLocations(locs);
         const state = get();
-        const anomalies = detectAnomalies(locs, state.pickRecords);
-        set({ locations: locs, anomalies });
+        const anomalies = detectAnomalies(valid, state.pickRecords);
+        set({ locations: valid, anomalies, importConflicts: conflicts });
+        return conflicts;
       },
 
       setPickRecords: (records) => {
@@ -202,14 +202,81 @@ export const useWarehouseStore = create<WarehouseStore>()(
       setHoveredLocation: (id) => set({ hoveredLocation: id }),
       setSidebarCollapsed: (v) => set({ sidebarCollapsed: v }),
 
+      setCameraState: (cs) =>
+        set((state) => ({
+          cameraState: { ...state.cameraState, ...cs },
+        })),
+
       loadSampleData: () => {
-        const anomalies = detectAnomalies(sampleLocations, samplePickRecords);
+        const { valid, conflicts } = filterConflictingLocations(sampleLocations);
+        const anomalies = detectAnomalies(valid, samplePickRecords);
         set({
-          locations: sampleLocations,
+          locations: valid,
           pickRecords: samplePickRecords,
           anomalies,
+          importConflicts: conflicts,
           filter: { dateRange: null, zones: [] },
         });
+      },
+
+      exportSnapshot: () => {
+        const state = get();
+        const activeBm = state.activeBookmark
+          ? state.cameraBookmarks.find((b) => b.id === state.activeBookmark)
+          : null;
+        const snapshot: SnapshotData = {
+          version: 1,
+          exportedAt: new Date().toISOString(),
+          anomalies: state.anomalies,
+          importConflicts: state.importConflicts,
+          filter: state.filter,
+          thresholds: state.thresholds,
+          cameraState: state.cameraState,
+          activeBookmarkId: state.activeBookmark,
+          activeBookmarkName: activeBm?.name ?? null,
+          locations: state.locations,
+          pickRecords: state.pickRecords,
+          cameraBookmarks: state.cameraBookmarks,
+        };
+        const blob = new Blob([JSON.stringify(snapshot, null, 2)], {
+          type: 'application/json',
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `warehouse-snapshot-${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      },
+
+      importSnapshot: (data) => {
+        try {
+          if (data.version !== 1) {
+            return { success: false, error: `不支持的快照版本: ${data.version}` };
+          }
+          if (!Array.isArray(data.locations) || !Array.isArray(data.pickRecords)) {
+            return { success: false, error: '快照数据缺少必要字段 (locations/pickRecords)' };
+          }
+
+          const { valid, conflicts } = filterConflictingLocations(data.locations);
+          const anomalies = detectAnomalies(valid, data.pickRecords);
+
+          set({
+            locations: valid,
+            pickRecords: data.pickRecords,
+            anomalies,
+            importConflicts: conflicts,
+            filter: data.filter ?? { dateRange: null, zones: [] },
+            thresholds: data.thresholds ?? { low: 25, medium: 50, high: 75 },
+            cameraState: data.cameraState ?? { position: [22, 16, 24], target: [7.5, 4.5, 7.5] },
+            activeBookmark: data.activeBookmarkId ?? null,
+            cameraBookmarks: data.cameraBookmarks ?? [],
+          });
+
+          return { success: true };
+        } catch (err) {
+          return { success: false, error: `快照导入失败: ${(err as Error).message}` };
+        }
       },
 
       exportAnomalies: () => {
@@ -230,15 +297,12 @@ export const useWarehouseStore = create<WarehouseStore>()(
         return computeHeatMap(locations, pickRecords, filter, thresholds);
       },
 
-      getConflictingIds: () => {
-        const { locations } = get();
-        return getConflictingIds(locations);
-      },
-
       getAvailableZones: () => {
         const { locations } = get();
         return [...new Set(locations.map((l) => l.zone))].sort();
       },
+
+      clearImportConflicts: () => set({ importConflicts: [] }),
     }),
     {
       name: 'warehouse-heatmap-store',
@@ -246,9 +310,11 @@ export const useWarehouseStore = create<WarehouseStore>()(
         locations: state.locations,
         pickRecords: state.pickRecords,
         anomalies: state.anomalies,
+        importConflicts: state.importConflicts,
         filter: state.filter,
         thresholds: state.thresholds,
         cameraBookmarks: state.cameraBookmarks,
+        cameraState: state.cameraState,
       }),
     }
   )

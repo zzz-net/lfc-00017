@@ -47,3 +47,30 @@ export interface LayoutData {
 export interface PicksData {
   records: PickRecord[];
 }
+
+export interface ImportConflict {
+  row: number;
+  coordinateKey: string;
+  rejectedIds: string[];
+  message: string;
+}
+
+export interface CameraState {
+  position: [number, number, number];
+  target: [number, number, number];
+}
+
+export interface SnapshotData {
+  version: 1;
+  exportedAt: string;
+  anomalies: Anomaly[];
+  importConflicts: ImportConflict[];
+  filter: FilterState;
+  thresholds: ThresholdConfig;
+  cameraState: CameraState;
+  activeBookmarkId: string | null;
+  activeBookmarkName: string | null;
+  locations: Location[];
+  pickRecords: PickRecord[];
+  cameraBookmarks: CameraBookmark[];
+}
