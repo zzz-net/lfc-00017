@@ -19,6 +19,16 @@ import type {
   SnapshotArchiveState,
   SnapshotSource,
   ArchiveImportResult,
+  BatchPriority,
+  BatchLocation,
+  ReplenishmentBatch,
+  ReplenishmentConflict,
+  ReplenishmentConflictType,
+  ReplenishmentImportResult,
+  ReplenishmentActionRecord,
+  SelectionBox,
+  ReplenishmentSandboxState,
+  ReplenishmentExportData,
 } from '@/types/warehouse';
 import { sampleLocations, samplePickRecords } from '@/data/sampleData';
 import { getPresetById } from '@/data/demoPresets';
@@ -642,6 +652,38 @@ interface WarehouseStore {
   restoreLatestOnStartup: () => ArchiveImportResult | null;
   importSnapshotWithArchive: (data: unknown, fileName?: string, mergeBookmarks?: boolean) => ArchiveImportResult;
   exportArchiveEntry: (entryId: string) => void;
+
+  replenishment: ReplenishmentSandboxState;
+  setSelectionMode: (enabled: boolean) => void;
+  setSelectionBox: (box: SelectionBox | null) => void;
+  toggleLocationSelection: (locationId: string) => void;
+  clearLocationSelection: () => void;
+  selectLocationsByHeat: (minHeatPercent: number) => void;
+  createBatchFromSelection: (opts?: { name?: string; priority?: BatchPriority }) => ReplenishmentBatch | null;
+  updateBatch: (batchId: string, updates: Partial<Omit<ReplenishmentBatch, 'id' | 'createdAt'>>) => void;
+  deleteBatch: (batchId: string) => void;
+  addLocationToBatch: (batchId: string, locationId: string) => void;
+  removeLocationFromBatch: (batchId: string, locationId: string) => void;
+  adjustBatchOrder: (batchId: string, newOrder: number) => void;
+  setActiveBatch: (batchId: string | null) => void;
+  computeBatchLocationShortage: (locationId: string, heatLevel: number) => BatchLocation;
+  exportReplenishmentBatches: () => void;
+  importReplenishmentBatches: (data: unknown) => ReplenishmentImportResult;
+  undoLastReplenishmentAction: () => ReplenishmentImportResult | null;
+  getReplenishmentUndoStackSize: () => number;
+  clearReplenishmentConflicts: () => void;
+  clearReplenishmentBatches: () => void;
+  saveReplenishmentDraft: () => void;
+  loadReplenishmentDraft: () => boolean;
+  getBatchesInProcessingOrder: () => ReplenishmentBatch[];
+  getLocationOccupancyMap: () => Map<string, { batchId: string; batchNo: string }>;
+  addReplenishmentActionLog: (
+    action: ReplenishmentActionRecord['action'],
+    description: string,
+    details?: Record<string, unknown>
+  ) => void;
+  clearReplenishmentLogs: () => void;
+  setAutoSaveEnabled: (enabled: boolean) => void;
 }
 
 export const useWarehouseStore = create<WarehouseStore>()(
@@ -672,6 +714,20 @@ export const useWarehouseStore = create<WarehouseStore>()(
         lastAutoSaveId: null,
         undoStack: [],
         currentImportSession: null,
+      },
+      replenishment: {
+        batches: [],
+        selectedLocationIds: [],
+        selectionMode: false,
+        selectionBox: null,
+        activeBatchId: null,
+        conflicts: [],
+        actionLogs: [],
+        undoStack: [],
+        nextBatchNo: 1,
+        autoSaveEnabled: false,
+        lastAutoSavedAt: null,
+        importSession: null,
       },
 
       setLocations: (locs) => {
@@ -1470,6 +1526,994 @@ export const useWarehouseStore = create<WarehouseStore>()(
           { fileName: entry.fileName, entryId }
         );
       },
+
+      setSelectionMode: (enabled) =>
+        set((state) => ({
+          replenishment: {
+            ...state.replenishment,
+            selectionMode: enabled,
+            selectedLocationIds: enabled ? state.replenishment.selectedLocationIds : [],
+            selectionBox: enabled ? state.replenishment.selectionBox : null,
+          },
+        })),
+
+      setSelectionBox: (box) =>
+        set((state) => ({
+          replenishment: { ...state.replenishment, selectionBox: box },
+        })),
+
+      toggleLocationSelection: (locationId) =>
+        set((state) => {
+          const exists = state.replenishment.selectedLocationIds.includes(locationId);
+          return {
+            replenishment: {
+              ...state.replenishment,
+              selectedLocationIds: exists
+                ? state.replenishment.selectedLocationIds.filter((id) => id !== locationId)
+                : [...state.replenishment.selectedLocationIds, locationId],
+            },
+          };
+        }),
+
+      clearLocationSelection: () =>
+        set((state) => ({
+          replenishment: { ...state.replenishment, selectedLocationIds: [], selectionBox: null },
+        })),
+
+      selectLocationsByHeat: (minHeatPercent) => {
+        const state = get();
+        const heatMap = computeHeatMap(
+          state.locations,
+          state.pickRecords,
+          state.filter,
+          state.thresholds
+        );
+        const counts = [...heatMap.values()].map((v) => v.count);
+        const maxCount = Math.max(...counts, 1);
+        const threshold = (minHeatPercent / 100) * maxCount;
+
+        const selectedIds: string[] = [];
+        heatMap.forEach((value, locId) => {
+          if (value.count >= threshold) {
+            selectedIds.push(locId);
+          }
+        });
+
+        set((s) => ({
+          replenishment: { ...s.replenishment, selectedLocationIds: selectedIds },
+        }));
+        get().addReplenishmentActionLog(
+          'update',
+          `按热度阈值 ${minHeatPercent}% 圈选了 ${selectedIds.length} 个高热货位`,
+          { minHeatPercent, selectedCount: selectedIds.length }
+        );
+      },
+
+      computeBatchLocationShortage: (locationId, heatLevel) => {
+        const state = get();
+        const location = state.locations.find((l) => l.id === locationId);
+        const heatMap = computeHeatMap(
+          state.locations,
+          state.pickRecords,
+          state.filter,
+          state.thresholds
+        );
+        const heatData = heatMap.get(locationId);
+        const count = heatData?.count ?? 0;
+        const counts = [...heatMap.values()].map((v) => v.count);
+        const maxCount = Math.max(...counts, 1);
+        const actualHeatLevel = Math.round((count / maxCount) * 100);
+
+        const baseTarget = 100;
+        const heatMultiplier = 1 + (actualHeatLevel / 100) * 2;
+        const targetStock = Math.round(baseTarget * heatMultiplier);
+        const currentStock = Math.max(0, Math.round(targetStock * (1 - actualHeatLevel / 150)));
+        const shortage = Math.max(0, targetStock - currentStock);
+
+        return {
+          locationId,
+          currentStock,
+          targetStock,
+          shortage,
+          heatLevel: actualHeatLevel,
+        };
+      },
+
+      createBatchFromSelection: (opts) => {
+        const state = get();
+        const { selectedLocationIds, nextBatchNo, batches } = state.replenishment;
+
+        if (selectedLocationIds.length === 0) {
+          get().addReplenishmentActionLog(
+            'create',
+            '创建批次失败：未选择任何货位',
+            { reason: 'no_selection' }
+          );
+          return null;
+        }
+
+        const occupancy = get().getLocationOccupancyMap();
+        const occupiedLocs: string[] = [];
+        const validLocs: string[] = [];
+
+        for (const locId of selectedLocationIds) {
+          if (occupancy.has(locId)) {
+            occupiedLocs.push(locId);
+          } else {
+            validLocs.push(locId);
+          }
+        }
+
+        if (validLocs.length === 0) {
+          set((s) => ({
+            replenishment: {
+              ...s.replenishment,
+              conflicts: [
+                ...s.replenishment.conflicts,
+                {
+                  type: 'location_occupied',
+                  message: `所选 ${selectedLocationIds.length} 个货位均已被其他批次占用`,
+                  locationId: occupiedLocs[0],
+                  details: { occupiedLocationIds: occupiedLocs },
+                  resolved: false,
+                  resolution: 'skip',
+                },
+              ],
+            },
+          }));
+          get().addReplenishmentActionLog(
+            'create',
+            '创建批次失败：所有选中货位均被占用',
+            { occupiedLocationIds: occupiedLocs }
+          );
+          return null;
+        }
+
+        const batchLocations: BatchLocation[] = validLocs.map((locId) => {
+          const loc = state.locations.find((l) => l.id === locId);
+          return get().computeBatchLocationShortage(locId, 0);
+        });
+
+        const totalShortage = batchLocations.reduce((sum, bl) => sum + bl.shortage, 0);
+        const avgHeat = batchLocations.length > 0
+          ? batchLocations.reduce((s, bl) => s + bl.heatLevel, 0) / batchLocations.length
+          : 0;
+
+        let priority: BatchPriority = 'medium';
+        if (avgHeat >= 80) priority = 'critical';
+        else if (avgHeat >= 60) priority = 'high';
+        else if (avgHeat >= 30) priority = 'medium';
+        else priority = 'low';
+        if (opts?.priority) priority = opts.priority;
+
+        const now = new Date().toISOString();
+        const batchNo = `RPL-${String(nextBatchNo).padStart(4, '0')}`;
+        const maxOrder = batches.length > 0 ? Math.max(...batches.map((b) => b.estimatedOrder)) : 0;
+
+        const newBatch: ReplenishmentBatch = {
+          id: `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          batchNo,
+          name: opts?.name ?? `补货批次 ${batchNo}`,
+          priority,
+          status: 'draft',
+          createdAt: now,
+          updatedAt: now,
+          estimatedOrder: maxOrder + 1,
+          locations: batchLocations,
+          totalShortage,
+        };
+
+        const previousBatches = JSON.parse(JSON.stringify(batches));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        const newConflicts: ReplenishmentConflict[] = [...state.replenishment.conflicts];
+        if (occupiedLocs.length > 0) {
+          newConflicts.push({
+            type: 'location_occupied',
+            message: `创建批次时跳过 ${occupiedLocs.length} 个已被占用的货位`,
+            details: { skippedLocationIds: occupiedLocs, batchNo },
+            batchNo,
+            resolved: true,
+            resolution: 'skip',
+          });
+        }
+
+        set((s) => ({
+          replenishment: {
+            ...s.replenishment,
+            batches: [...s.replenishment.batches, newBatch],
+            nextBatchNo: s.replenishment.nextBatchNo + 1,
+            selectedLocationIds: [],
+            selectionBox: null,
+            conflicts: newConflicts,
+            activeBatchId: newBatch.id,
+            undoStack: [
+              {
+                actionId,
+                batches: previousBatches,
+                timestamp: now,
+                description: `撤销创建批次 ${batchNo}`,
+              },
+              ...s.replenishment.undoStack,
+            ].slice(0, 20),
+          },
+        }));
+
+        get().addReplenishmentActionLog(
+          'create',
+          `创建补货批次 ${batchNo}: ${validLocs.length} 个货位，总缺口 ${totalShortage}，优先级 ${priority}`,
+          {
+            batchId: newBatch.id,
+            batchNo,
+            locationCount: validLocs.length,
+            totalShortage,
+            priority,
+            skippedCount: occupiedLocs.length,
+          }
+        );
+
+        if (state.replenishment.autoSaveEnabled) {
+          get().saveReplenishmentDraft();
+        }
+
+        return newBatch;
+      },
+
+      updateBatch: (batchId, updates) => {
+        const state = get();
+        const previousBatches = JSON.parse(JSON.stringify(state.replenishment.batches));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const batch = state.replenishment.batches.find((b) => b.id === batchId);
+        if (!batch) return;
+
+        set((s) => ({
+          replenishment: {
+            ...s.replenishment,
+            batches: s.replenishment.batches.map((b) =>
+              b.id === batchId
+                ? {
+                    ...b,
+                    ...updates,
+                    updatedAt: new Date().toISOString(),
+                    totalShortage: updates.locations
+                      ? updates.locations.reduce((sum, bl) => sum + bl.shortage, 0)
+                      : b.totalShortage,
+                  }
+                : b
+            ),
+            undoStack: [
+              {
+                actionId,
+                batches: previousBatches,
+                timestamp: new Date().toISOString(),
+                description: `撤销更新批次 ${batch.batchNo}`,
+              },
+              ...s.replenishment.undoStack,
+            ].slice(0, 20),
+          },
+        }));
+
+        get().addReplenishmentActionLog(
+          'update',
+          `更新批次 ${batch.batchNo}`,
+          { batchId, batchNo: batch.batchNo, updatedFields: Object.keys(updates) }
+        );
+
+        if (state.replenishment.autoSaveEnabled) {
+          get().saveReplenishmentDraft();
+        }
+      },
+
+      deleteBatch: (batchId) => {
+        const state = get();
+        const batch = state.replenishment.batches.find((b) => b.id === batchId);
+        if (!batch) return;
+
+        const previousBatches = JSON.parse(JSON.stringify(state.replenishment.batches));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        set((s) => ({
+          replenishment: {
+            ...s.replenishment,
+            batches: s.replenishment.batches.filter((b) => b.id !== batchId),
+            activeBatchId: s.replenishment.activeBatchId === batchId ? null : s.replenishment.activeBatchId,
+            undoStack: [
+              {
+                actionId,
+                batches: previousBatches,
+                timestamp: new Date().toISOString(),
+                description: `撤销删除批次 ${batch.batchNo}`,
+              },
+              ...s.replenishment.undoStack,
+            ].slice(0, 20),
+          },
+        }));
+
+        get().addReplenishmentActionLog(
+          'delete',
+          `删除批次 ${batch.batchNo}（${batch.locations.length} 个货位）`,
+          { batchId, batchNo: batch.batchNo, locationCount: batch.locations.length }
+        );
+
+        if (state.replenishment.autoSaveEnabled) {
+          get().saveReplenishmentDraft();
+        }
+      },
+
+      addLocationToBatch: (batchId, locationId) => {
+        const state = get();
+        const batch = state.replenishment.batches.find((b) => b.id === batchId);
+        if (!batch) return;
+
+        const occupancy = get().getLocationOccupancyMap();
+        if (occupancy.has(locationId) && occupancy.get(locationId)!.batchId !== batchId) {
+          const conflict: ReplenishmentConflict = {
+            type: 'location_occupied',
+            message: `货位 ${locationId} 已被批次 ${occupancy.get(locationId)!.batchNo} 占用`,
+            locationId,
+            batchNo: batch.batchNo,
+            details: { occupiedByBatchNo: occupancy.get(locationId)!.batchNo },
+            resolved: false,
+            resolution: 'skip',
+          };
+          set((s) => ({
+            replenishment: {
+              ...s.replenishment,
+              conflicts: [...s.replenishment.conflicts, conflict],
+            },
+          }));
+          return;
+        }
+
+        if (batch.locations.some((bl) => bl.locationId === locationId)) return;
+
+        const batchLoc = get().computeBatchLocationShortage(locationId, 0);
+        get().updateBatch(batchId, {
+          locations: [...batch.locations, batchLoc],
+        });
+        get().addReplenishmentActionLog(
+          'update',
+          `批次 ${batch.batchNo} 添加货位 ${locationId}（缺口 ${batchLoc.shortage}）`,
+          { batchId, locationId, shortage: batchLoc.shortage }
+        );
+      },
+
+      removeLocationFromBatch: (batchId, locationId) => {
+        const state = get();
+        const batch = state.replenishment.batches.find((b) => b.id === batchId);
+        if (!batch) return;
+
+        const filtered = batch.locations.filter((bl) => bl.locationId !== locationId);
+        get().updateBatch(batchId, { locations: filtered });
+        get().addReplenishmentActionLog(
+          'update',
+          `批次 ${batch.batchNo} 移除货位 ${locationId}`,
+          { batchId, locationId }
+        );
+      },
+
+      adjustBatchOrder: (batchId, newOrder) => {
+        const state = get();
+        const previousBatches = JSON.parse(JSON.stringify(state.replenishment.batches));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const batches = [...state.replenishment.batches];
+        const batch = batches.find((b) => b.id === batchId);
+        if (!batch) return;
+
+        const oldOrder = batch.estimatedOrder;
+        const minOrder = 1;
+        const maxOrder = batches.length;
+        const clampedNewOrder = Math.max(minOrder, Math.min(maxOrder, newOrder));
+
+        if (clampedNewOrder < oldOrder) {
+          batches.forEach((b) => {
+            if (b.estimatedOrder >= clampedNewOrder && b.estimatedOrder < oldOrder) {
+              b.estimatedOrder++;
+            }
+          });
+        } else if (clampedNewOrder > oldOrder) {
+          batches.forEach((b) => {
+            if (b.estimatedOrder > oldOrder && b.estimatedOrder <= clampedNewOrder) {
+              b.estimatedOrder--;
+            }
+          });
+        }
+
+        const targetBatch = batches.find((b) => b.id === batchId)!;
+        targetBatch.estimatedOrder = clampedNewOrder;
+        targetBatch.updatedAt = new Date().toISOString();
+
+        set((s) => ({
+          replenishment: {
+            ...s.replenishment,
+            batches,
+            undoStack: [
+              {
+                actionId,
+                batches: previousBatches,
+                timestamp: new Date().toISOString(),
+                description: `撤销调整批次 ${batch.batchNo} 顺序`,
+              },
+              ...s.replenishment.undoStack,
+            ].slice(0, 20),
+          },
+        }));
+
+        get().addReplenishmentActionLog(
+          'adjust_order',
+          `批次 ${batch.batchNo} 处理顺序: ${oldOrder} → ${clampedNewOrder}`,
+          { batchId, batchNo: batch.batchNo, oldOrder, newOrder: clampedNewOrder }
+        );
+
+        if (state.replenishment.autoSaveEnabled) {
+          get().saveReplenishmentDraft();
+        }
+      },
+
+      setActiveBatch: (batchId) =>
+        set((state) => ({
+          replenishment: { ...state.replenishment, activeBatchId: batchId },
+        })),
+
+      getBatchesInProcessingOrder: () => {
+        const state = get();
+        const priorityOrder: Record<BatchPriority, number> = {
+          critical: 0,
+          high: 1,
+          medium: 2,
+          low: 3,
+        };
+        return [...state.replenishment.batches].sort((a, b) => {
+          if (a.estimatedOrder !== b.estimatedOrder) {
+            return a.estimatedOrder - b.estimatedOrder;
+          }
+          if (priorityOrder[a.priority] !== priorityOrder[b.priority]) {
+            return priorityOrder[a.priority] - priorityOrder[b.priority];
+          }
+          return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+        });
+      },
+
+      getLocationOccupancyMap: () => {
+        const state = get();
+        const map = new Map<string, { batchId: string; batchNo: string }>();
+        for (const batch of state.replenishment.batches) {
+          for (const loc of batch.locations) {
+            map.set(loc.locationId, { batchId: batch.id, batchNo: batch.batchNo });
+          }
+        }
+        return map;
+      },
+
+      exportReplenishmentBatches: () => {
+        const state = get();
+        const batches = state.replenishment.batches;
+        const priorityBreakdown: Record<BatchPriority, number> = {
+          critical: 0, high: 0, medium: 0, low: 0,
+        };
+        let totalLocations = 0;
+        let totalShortage = 0;
+
+        for (const b of batches) {
+          priorityBreakdown[b.priority]++;
+          totalLocations += b.locations.length;
+          totalShortage += b.totalShortage;
+        }
+
+        const exportData: ReplenishmentExportData = {
+          version: 1,
+          exportedAt: new Date().toISOString(),
+          batches,
+          summary: {
+            totalBatches: batches.length,
+            totalLocations,
+            totalShortage,
+            priorityBreakdown,
+          },
+        };
+
+        const fileName = `replenishment-batches-${new Date().toISOString().slice(0, 10)}-${new Date().toISOString().slice(11, 19).replace(/:/g, '')}.json`;
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], {
+          type: 'application/json',
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        get().addReplenishmentActionLog(
+          'update',
+          `已导出 ${batches.length} 个补货批次到 ${fileName}`,
+          { fileName, batchCount: batches.length }
+        );
+        get().addPlaybackLog(
+          'success',
+          `补货批次已导出: ${fileName}（${batches.length} 个批次）`,
+          { fileName, batchCount: batches.length }
+        );
+      },
+
+      importReplenishmentBatches: (data) => {
+        const state = get();
+        const now = new Date().toISOString();
+        const previousBatches = JSON.parse(JSON.stringify(state.replenishment.batches));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const conflicts: ReplenishmentConflict[] = [];
+        const warnings: string[] = [];
+
+        try {
+          if (!data || typeof data !== 'object') {
+            return {
+              success: false,
+              importedBatches: 0,
+              skippedBatches: 0,
+              conflicts: [{
+                type: 'missing_required_field',
+                message: '导入数据格式无效',
+                resolved: false,
+              }],
+              warnings: ['数据不是有效的 JSON 对象'],
+              canUndo: false,
+            };
+          }
+
+          const obj = data as Record<string, unknown>;
+
+          if (obj.version !== 1) {
+            conflicts.push({
+              type: 'version_mismatch',
+              message: `导入数据版本 ${obj.version} 与当前版本 1 不匹配，尝试兼容导入`,
+              details: { importedVersion: obj.version, currentVersion: 1 },
+              resolved: true,
+              resolution: 'merge',
+            });
+            warnings.push(`版本不匹配: v${obj.version}，以兼容模式处理`);
+          }
+
+          const incomingBatchesRaw = obj.batches;
+          if (!Array.isArray(incomingBatchesRaw)) {
+            return {
+              success: false,
+              importedBatches: 0,
+              skippedBatches: 0,
+              conflicts: [{
+                type: 'missing_required_field',
+                message: '缺少必填字段 batches',
+                details: { field: 'batches' },
+                resolved: false,
+              }],
+              warnings: ['缺少 batches 字段'],
+              canUndo: false,
+            };
+          }
+
+          const requiredBatchFields = ['id', 'batchNo', 'name', 'priority', 'status', 'locations', 'estimatedOrder'] as const;
+          const existingBatchNos = new Set(state.replenishment.batches.map((b) => b.batchNo));
+          const occupancy = get().getLocationOccupancyMap();
+          const validLocationIds = new Set(state.locations.map((l) => l.id));
+          const finalBatches: ReplenishmentBatch[] = [];
+          let imported = 0;
+          let skipped = 0;
+          let maxNextBatchNo = state.replenishment.nextBatchNo;
+
+          for (let i = 0; i < incomingBatchesRaw.length; i++) {
+            const raw = incomingBatchesRaw[i] as Record<string, unknown>;
+            const missingFields: string[] = [];
+
+            for (const field of requiredBatchFields) {
+              if (!(field in raw)) {
+                missingFields.push(field);
+              }
+            }
+
+            if (missingFields.length > 0) {
+              conflicts.push({
+                type: 'missing_required_field',
+                message: `第 ${i + 1} 个批次缺少必填字段: ${missingFields.join(', ')}，已跳过`,
+                details: { index: i, missingFields },
+                resolved: true,
+                resolution: 'skip',
+              });
+              warnings.push(`批次 #${i + 1} 缺字段: ${missingFields.join(', ')}，跳过`);
+              skipped++;
+              continue;
+            }
+
+            let batchNo = String(raw.batchNo);
+            if (existingBatchNos.has(batchNo)) {
+              const oldNo = batchNo;
+              let suffix = 2;
+              while (existingBatchNos.has(`${batchNo}-(${suffix})`)) {
+                suffix++;
+              }
+              batchNo = `${batchNo}-(${suffix})`;
+              conflicts.push({
+                type: 'duplicate_batch_no',
+                message: `批次编号 ${oldNo} 重复，已自动重命名为 ${batchNo}`,
+                batchNo,
+                details: { originalBatchNo: oldNo, renamedBatchNo: batchNo },
+                resolved: true,
+                resolution: 'rename',
+              });
+              warnings.push(`批次编号重复: ${oldNo} → ${batchNo}`);
+            }
+
+            const rawLocations = Array.isArray(raw.locations) ? raw.locations : [];
+            const validBatchLocations: BatchLocation[] = [];
+
+            for (const rl of rawLocations as unknown[]) {
+              if (!rl || typeof rl !== 'object') continue;
+              const locObj = rl as Record<string, unknown>;
+              const locId = String(locObj.locationId ?? '');
+
+              if (!locId) continue;
+              if (!validLocationIds.has(locId)) {
+                conflicts.push({
+                  type: 'unknown_location',
+                  message: `批次 ${batchNo} 包含未知货位 ${locId}，已跳过`,
+                  locationId: locId,
+                  batchNo,
+                  details: { locationId: locId },
+                  resolved: true,
+                  resolution: 'skip',
+                });
+                continue;
+              }
+
+              if (occupancy.has(locId)) {
+                conflicts.push({
+                  type: 'location_occupied',
+                  message: `货位 ${locId} 已被现有批次 ${occupancy.get(locId)!.batchNo} 占用，批次 ${batchNo} 跳过该货位`,
+                  locationId: locId,
+                  batchNo,
+                  details: { occupiedByBatchNo: occupancy.get(locId)!.batchNo },
+                  resolved: true,
+                  resolution: 'skip',
+                });
+                continue;
+              }
+
+              if (finalBatches.some((b) => b.locations.some((bl) => bl.locationId === locId))) {
+                conflicts.push({
+                  type: 'location_occupied',
+                  message: `货位 ${locId} 在导入文件内重复出现，批次 ${batchNo} 跳过重复项`,
+                  locationId: locId,
+                  batchNo,
+                  resolved: true,
+                  resolution: 'skip',
+                });
+                continue;
+              }
+
+              const bl: BatchLocation = {
+                locationId: locId,
+                currentStock: typeof locObj.currentStock === 'number' ? locObj.currentStock : 0,
+                targetStock: typeof locObj.targetStock === 'number' ? locObj.targetStock : 100,
+                shortage: typeof locObj.shortage === 'number' ? locObj.shortage : 0,
+                heatLevel: typeof locObj.heatLevel === 'number' ? locObj.heatLevel : 0,
+              };
+
+              if (bl.shortage <= 0 && bl.targetStock > bl.currentStock) {
+                bl.shortage = bl.targetStock - bl.currentStock;
+              }
+
+              validBatchLocations.push(bl);
+              occupancy.set(locId, { batchId: String(raw.id ?? ''), batchNo });
+            }
+
+            if (validBatchLocations.length === 0) {
+              conflicts.push({
+                type: 'missing_required_field',
+                message: `批次 ${batchNo} 无有效货位，已跳过`,
+                batchNo,
+                details: { reason: 'no_valid_locations' },
+                resolved: true,
+                resolution: 'skip',
+              });
+              skipped++;
+              continue;
+            }
+
+            const batch: ReplenishmentBatch = {
+              id: typeof raw.id === 'string' && raw.id
+                ? raw.id
+                : `imp-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+              batchNo,
+              name: String(raw.name ?? batchNo),
+              priority: ['critical', 'high', 'medium', 'low'].includes(String(raw.priority))
+                ? raw.priority as BatchPriority
+                : 'medium',
+              status: ['draft', 'pending', 'processing', 'completed'].includes(String(raw.status))
+                ? raw.status as ReplenishmentBatch['status']
+                : 'draft',
+              createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : now,
+              updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : now,
+              estimatedOrder: typeof raw.estimatedOrder === 'number' ? raw.estimatedOrder : 9999,
+              locations: validBatchLocations,
+              totalShortage: typeof raw.totalShortage === 'number'
+                ? raw.totalShortage
+                : validBatchLocations.reduce((s, bl) => s + bl.shortage, 0),
+              notes: typeof raw.notes === 'string' ? raw.notes : undefined,
+            };
+
+            finalBatches.push(batch);
+            existingBatchNos.add(batchNo);
+            imported++;
+
+            const noMatch = batchNo.match(/RPL-(\d+)/);
+            if (noMatch) {
+              const n = parseInt(noMatch[1], 10) + 1;
+              if (n > maxNextBatchNo) maxNextBatchNo = n;
+            }
+          }
+
+          const orderedBatches = [...state.replenishment.batches, ...finalBatches];
+          const existingMaxOrder = state.replenishment.batches.length > 0
+            ? Math.max(...state.replenishment.batches.map((b) => b.estimatedOrder))
+            : 0;
+          const importedUnsorted = finalBatches.filter((b) => b.estimatedOrder === 9999);
+          importedUnsorted.forEach((b, idx) => {
+            const target = orderedBatches.find((ob) => ob.id === b.id);
+            if (target) target.estimatedOrder = existingMaxOrder + idx + 1;
+          });
+
+          set((s) => ({
+            replenishment: {
+              ...s.replenishment,
+              batches: orderedBatches,
+              conflicts: [...s.replenishment.conflicts, ...conflicts],
+              nextBatchNo: maxNextBatchNo,
+              undoStack: [
+                {
+                  actionId,
+                  batches: previousBatches,
+                  timestamp: now,
+                  description: `撤销导入补货批次（${imported} 个）`,
+                },
+                ...s.replenishment.undoStack,
+              ].slice(0, 20),
+              importSession: {
+                previousBatches,
+                actionId,
+              },
+              lastAutoSavedAt: s.replenishment.autoSaveEnabled ? now : s.replenishment.lastAutoSavedAt,
+            },
+          }));
+
+          get().addReplenishmentActionLog(
+            'import',
+            `导入补货批次完成: 成功 ${imported} 个，跳过 ${skipped} 个，冲突 ${conflicts.length} 条`,
+            { imported, skipped, conflictCount: conflicts.length, actionId }
+          );
+          get().addPlaybackLog(
+            conflicts.length > 0 ? 'warning' : 'success',
+            `补货批次导入: 成功 ${imported} 个，跳过 ${skipped} 个，冲突 ${conflicts.length} 条，可撤销`,
+            { imported, skipped, conflictCount: conflicts.length }
+          );
+
+          if (state.replenishment.autoSaveEnabled) {
+            get().saveReplenishmentDraft();
+          }
+
+          return {
+            success: true,
+            importedBatches: imported,
+            skippedBatches: skipped,
+            conflicts,
+            warnings,
+            canUndo: true,
+            actionId,
+          };
+        } catch (err) {
+          console.error('补货批次导入异常:', err);
+          get().addPlaybackLog(
+            'error',
+            `补货批次导入失败: ${(err as Error).message}`,
+            { error: (err as Error).message }
+          );
+          return {
+            success: false,
+            importedBatches: 0,
+            skippedBatches: 0,
+            conflicts: [...conflicts, {
+              type: 'missing_required_field',
+              message: `导入异常: ${(err as Error).message}`,
+              resolved: false,
+            }],
+            warnings: [...warnings, `异常: ${(err as Error).message}`],
+            canUndo: false,
+          };
+        }
+      },
+
+      undoLastReplenishmentAction: () => {
+        const state = get();
+        if (state.replenishment.undoStack.length === 0) {
+          get().addPlaybackLog('warning', '撤销失败: 补货沙盘撤销栈为空');
+          return null;
+        }
+
+        const undoItem = state.replenishment.undoStack[0];
+        const previousBatches = undoItem.batches;
+
+        set((s) => ({
+          replenishment: {
+            ...s.replenishment,
+            batches: previousBatches,
+            undoStack: s.replenishment.undoStack.slice(1),
+            importSession: null,
+            lastAutoSavedAt: s.replenishment.autoSaveEnabled ? new Date().toISOString() : s.replenishment.lastAutoSavedAt,
+          },
+        }));
+
+        get().addReplenishmentActionLog(
+          'update',
+          `已撤销: ${undoItem.description}`,
+          { actionId: undoItem.actionId }
+        );
+        get().addPlaybackLog(
+          'success',
+          `补货沙盘: ${undoItem.description}`,
+          { actionId: undoItem.actionId }
+        );
+
+        if (state.replenishment.autoSaveEnabled) {
+          get().saveReplenishmentDraft();
+        }
+
+        return {
+          success: true,
+          importedBatches: 0,
+          skippedBatches: 0,
+          conflicts: [],
+          warnings: [],
+          canUndo: state.replenishment.undoStack.length > 1,
+        };
+      },
+
+      getReplenishmentUndoStackSize: () => get().replenishment.undoStack.length,
+
+      clearReplenishmentConflicts: () =>
+        set((state) => ({
+          replenishment: { ...state.replenishment, conflicts: [] },
+        })),
+
+      clearReplenishmentBatches: () => {
+        const state = get();
+        const previousBatches = JSON.parse(JSON.stringify(state.replenishment.batches));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        set((s) => ({
+          replenishment: {
+            ...s.replenishment,
+            batches: [],
+            selectedLocationIds: [],
+            activeBatchId: null,
+            selectionBox: null,
+            nextBatchNo: 1,
+            undoStack: [
+              {
+                actionId,
+                batches: previousBatches,
+                timestamp: new Date().toISOString(),
+                description: `撤销清空全部批次（${previousBatches.length} 个）`,
+              },
+              ...s.replenishment.undoStack,
+            ].slice(0, 20),
+          },
+        }));
+
+        get().addReplenishmentActionLog(
+          'delete',
+          `清空全部 ${previousBatches.length} 个补货批次`,
+          { clearedCount: previousBatches.length }
+        );
+
+        if (state.replenishment.autoSaveEnabled) {
+          get().saveReplenishmentDraft();
+        }
+      },
+
+      saveReplenishmentDraft: () => {
+        try {
+          const state = get();
+          const draft = {
+            version: 1 as const,
+            savedAt: new Date().toISOString(),
+            batches: state.replenishment.batches,
+            nextBatchNo: state.replenishment.nextBatchNo,
+          };
+          localStorage.setItem('replenishment-draft', JSON.stringify(draft));
+          set((s) => ({
+            replenishment: { ...s.replenishment, lastAutoSavedAt: new Date().toISOString() },
+          }));
+        } catch (err) {
+          console.error('保存补货草稿失败:', err);
+          get().addPlaybackLog(
+            'error',
+            `保存补货草稿失败: ${(err as Error).message}`,
+            { error: (err as Error).message }
+          );
+        }
+      },
+
+      loadReplenishmentDraft: () => {
+        try {
+          const raw = localStorage.getItem('replenishment-draft');
+          if (!raw) return false;
+          const parsed = JSON.parse(raw);
+          if (!parsed || typeof parsed !== 'object') return false;
+
+          const conflicts: ReplenishmentConflict[] = [];
+          if (parsed.version !== 1) {
+            conflicts.push({
+              type: 'version_mismatch',
+              message: `草稿版本 ${parsed.version} 与当前版本 1 不匹配，尝试恢复`,
+              details: { draftVersion: parsed.version },
+              resolved: true,
+              resolution: 'merge',
+            });
+          }
+
+          const batches = Array.isArray(parsed.batches) ? parsed.batches : [];
+          const nextBatchNo = typeof parsed.nextBatchNo === 'number' ? parsed.nextBatchNo : 1;
+
+          set((state) => ({
+            replenishment: {
+              ...state.replenishment,
+              batches,
+              nextBatchNo,
+              conflicts: [...state.replenishment.conflicts, ...conflicts],
+              lastAutoSavedAt: typeof parsed.savedAt === 'string' ? parsed.savedAt : null,
+            },
+          }));
+
+          if (batches.length > 0) {
+            get().addReplenishmentActionLog(
+              'import',
+              `从本地草稿恢复 ${batches.length} 个补货批次`,
+              { draftSavedAt: parsed.savedAt, batchCount: batches.length }
+            );
+            get().addPlaybackLog(
+              'info',
+              `补货沙盘: 已从本地草稿恢复 ${batches.length} 个批次`,
+              { batchCount: batches.length }
+            );
+          }
+          return true;
+        } catch (err) {
+          console.error('加载补货草稿失败:', err);
+          return false;
+        }
+      },
+
+      addReplenishmentActionLog: (action, description, details) => {
+        const record: ReplenishmentActionRecord = {
+          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          action,
+          description,
+          details,
+        };
+        set((state) => ({
+          replenishment: {
+            ...state.replenishment,
+            actionLogs: [record, ...state.replenishment.actionLogs].slice(0, 100),
+          },
+        }));
+      },
+
+      clearReplenishmentLogs: () =>
+        set((state) => ({
+          replenishment: { ...state.replenishment, actionLogs: [] },
+        })),
+
+      setAutoSaveEnabled: (enabled) =>
+        set((state) => ({
+          replenishment: { ...state.replenishment, autoSaveEnabled: enabled },
+        })),
     }),
     {
       name: 'warehouse-heatmap-store',
@@ -1496,6 +2540,20 @@ export const useWarehouseStore = create<WarehouseStore>()(
           lastAutoSaveId: state.archive.lastAutoSaveId,
           undoStack: state.archive.undoStack,
           currentImportSession: null,
+        },
+        replenishment: {
+          batches: state.replenishment.batches,
+          selectedLocationIds: [],
+          selectionMode: false,
+          selectionBox: null,
+          activeBatchId: state.replenishment.activeBatchId,
+          conflicts: state.replenishment.conflicts,
+          actionLogs: [],
+          undoStack: state.replenishment.undoStack.slice(0, 5),
+          nextBatchNo: state.replenishment.nextBatchNo,
+          autoSaveEnabled: state.replenishment.autoSaveEnabled,
+          lastAutoSavedAt: state.replenishment.lastAutoSavedAt,
+          importSession: null,
         },
       }),
       onRehydrateStorage: () => (state) => {
@@ -1528,6 +2586,22 @@ export const useWarehouseStore = create<WarehouseStore>()(
         if (state?.archive && typeof state.archive === 'object') {
           const normalized = validateAndNormalizeArchiveState(state.archive as unknown as Record<string, unknown>);
           state.archive = normalized;
+        }
+        if (state && !state.replenishment) {
+          state.replenishment = {
+            batches: [],
+            selectedLocationIds: [],
+            selectionMode: false,
+            selectionBox: null,
+            activeBatchId: null,
+            conflicts: [],
+            actionLogs: [],
+            undoStack: [],
+            nextBatchNo: 1,
+            autoSaveEnabled: true,
+            lastAutoSavedAt: null,
+            importSession: null,
+          };
         }
       },
     }

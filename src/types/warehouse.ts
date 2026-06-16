@@ -171,3 +171,116 @@ export interface SnapshotArchiveState {
     importLogs: PlaybackLogEntry[];
   } | null;
 }
+
+export type BatchPriority = 'critical' | 'high' | 'medium' | 'low';
+
+export interface BatchLocation {
+  locationId: string;
+  currentStock: number;
+  targetStock: number;
+  shortage: number;
+  heatLevel: number;
+}
+
+export interface ReplenishmentBatch {
+  id: string;
+  batchNo: string;
+  name: string;
+  priority: BatchPriority;
+  status: 'draft' | 'pending' | 'processing' | 'completed';
+  createdAt: string;
+  updatedAt: string;
+  estimatedOrder: number;
+  locations: BatchLocation[];
+  totalShortage: number;
+  notes?: string;
+}
+
+export interface ReplenishmentDraft {
+  version: 1;
+  savedAt: string;
+  batches: ReplenishmentBatch[];
+  nextBatchNo: number;
+}
+
+export type ReplenishmentConflictType =
+  | 'duplicate_batch_no'
+  | 'location_occupied'
+  | 'missing_required_field'
+  | 'unknown_location'
+  | 'version_mismatch';
+
+export interface ReplenishmentConflict {
+  type: ReplenishmentConflictType;
+  message: string;
+  details?: Record<string, unknown>;
+  batchNo?: string;
+  locationId?: string;
+  resolved?: boolean;
+  resolution?: 'skip' | 'rename' | 'overwrite' | 'merge';
+}
+
+export interface ReplenishmentImportResult {
+  success: boolean;
+  importedBatches: number;
+  skippedBatches: number;
+  conflicts: ReplenishmentConflict[];
+  warnings: string[];
+  canUndo: boolean;
+  actionId?: string;
+}
+
+export interface ReplenishmentActionRecord {
+  id: string;
+  timestamp: string;
+  action: 'create' | 'update' | 'delete' | 'adjust_order' | 'import' | 'merge' | 'split';
+  description: string;
+  details?: Record<string, unknown>;
+  previousState?: ReplenishmentBatch[];
+}
+
+export interface SelectionBox {
+  zone?: string;
+  minRow?: number;
+  maxRow?: number;
+  minCol?: number;
+  maxCol?: number;
+  minLayer?: number;
+  maxLayer?: number;
+  minHeat?: number;
+}
+
+export interface ReplenishmentSandboxState {
+  batches: ReplenishmentBatch[];
+  selectedLocationIds: string[];
+  selectionMode: boolean;
+  selectionBox: SelectionBox | null;
+  activeBatchId: string | null;
+  conflicts: ReplenishmentConflict[];
+  actionLogs: ReplenishmentActionRecord[];
+  undoStack: Array<{
+    actionId: string;
+    batches: ReplenishmentBatch[];
+    timestamp: string;
+    description: string;
+  }>;
+  nextBatchNo: number;
+  autoSaveEnabled: boolean;
+  lastAutoSavedAt: string | null;
+  importSession: {
+    previousBatches: ReplenishmentBatch[];
+    actionId: string;
+  } | null;
+}
+
+export interface ReplenishmentExportData {
+  version: 1;
+  exportedAt: string;
+  batches: ReplenishmentBatch[];
+  summary: {
+    totalBatches: number;
+    totalLocations: number;
+    totalShortage: number;
+    priorityBreakdown: Record<BatchPriority, number>;
+  };
+}

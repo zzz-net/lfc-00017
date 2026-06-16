@@ -5,6 +5,7 @@ import ThresholdPanel from './sidebar/ThresholdPanel';
 import BookmarkPanel from './sidebar/BookmarkPanel';
 import AnomalyPanel from './sidebar/AnomalyPanel';
 import SnapshotArchive from './sidebar/SnapshotArchive';
+import ReplenishmentSandbox from './sidebar/ReplenishmentSandbox';
 import { useWarehouseStore } from '@/store/warehouseStore';
 
 export default function Sidebar() {
@@ -63,6 +64,9 @@ export default function Sidebar() {
 
             <div className="h-px bg-[#2a3a4e]" />
             <SnapshotArchive />
+
+            <div className="h-px bg-[#2a3a4e]" />
+            <ReplenishmentSandbox />
 
             {locations.length > 0 && (
               <>

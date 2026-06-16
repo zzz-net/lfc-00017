@@ -7,6 +7,7 @@ import BookmarkPanel from './sidebar/BookmarkPanel';
 import AnomalyPanel from './sidebar/AnomalyPanel';
 import PlaybackLog from './sidebar/PlaybackLog';
 import SnapshotArchive from './sidebar/SnapshotArchive';
+import ReplenishmentSandbox from './sidebar/ReplenishmentSandbox';
 import { useWarehouseStore } from '@/store/warehouseStore';
 
 export default function PlaybackSidebar() {
@@ -85,6 +86,9 @@ export default function PlaybackSidebar() {
 
             <div className="h-px bg-[#2a3a4e]" />
             <SnapshotArchive />
+
+            <div className="h-px bg-[#2a3a4e]" />
+            <ReplenishmentSandbox />
 
             {locations.length > 0 && (
               <>

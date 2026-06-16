@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { useWarehouseStore, buildSnapshotExportFileName } from '@/store/warehouseStore';
-import type { Location, PickRecord, SnapshotData, ImportWarningType } from '@/types/warehouse';
+import type { Location, PickRecord, SnapshotData, ImportWarningType, SnapshotArchiveState } from '@/types/warehouse';
 import { demoPresets, getPresetById } from '@/data/demoPresets';
 
 function makeLoc(id: string, zone: string, row: number, col: number, layer: number): Location {
@@ -1379,6 +1379,919 @@ describe('快照归档中心: 导入链路 & 撤销', () => {
     expect(useWarehouseStore.getState().locations.map((l) => l.id)).toEqual(['SAFE-1']);
     expect(useWarehouseStore.getState().archive.entries).toHaveLength(0);
     expect(useWarehouseStore.getState().archive.undoStack).toHaveLength(0);
+  });
+});
+
+function resetReplenishmentStore() {
+  const locs = [
+    makeLoc('RPL-A1', 'A', 1, 1, 1),
+    makeLoc('RPL-A2', 'A', 1, 2, 1),
+    makeLoc('RPL-A3', 'A', 2, 1, 1),
+    makeLoc('RPL-B1', 'B', 1, 1, 1),
+    makeLoc('RPL-B2', 'B', 1, 2, 1),
+    makeLoc('RPL-B3', 'B', 2, 1, 1),
+    makeLoc('RPL-C1', 'C', 1, 1, 1),
+    makeLoc('RPL-C2', 'C', 1, 2, 1),
+  ];
+  const picks = [
+    { locationId: 'RPL-A1', timestamp: '2024-06-01T08:00:00Z', quantity: 100 },
+    { locationId: 'RPL-A2', timestamp: '2024-06-01T09:00:00Z', quantity: 80 },
+    { locationId: 'RPL-A3', timestamp: '2024-06-01T10:00:00Z', quantity: 20 },
+    { locationId: 'RPL-B1', timestamp: '2024-06-01T11:00:00Z', quantity: 60 },
+    { locationId: 'RPL-B2', timestamp: '2024-06-01T12:00:00Z', quantity: 40 },
+    { locationId: 'RPL-C1', timestamp: '2024-06-01T13:00:00Z', quantity: 90 },
+    { locationId: 'RPL-C2', timestamp: '2024-06-01T14:00:00Z', quantity: 70 },
+  ];
+
+  resetStoreWithArchive();
+  useWarehouseStore.getState().setLocations(locs);
+  useWarehouseStore.getState().setPickRecords(picks);
+  useWarehouseStore.setState({
+    replenishment: {
+      batches: [],
+      selectedLocationIds: [],
+      selectionMode: false,
+      selectionBox: null,
+      activeBatchId: null,
+      conflicts: [],
+      actionLogs: [],
+      undoStack: [],
+      nextBatchNo: 1,
+      autoSaveEnabled: false,
+      lastAutoSavedAt: null,
+      importSession: null,
+    },
+  });
+}
+
+describe('补货任务沙盘: 圈选与批次创建', () => {
+  beforeEach(() => {
+    resetReplenishmentStore();
+  });
+
+  it('圈选模式切换应正确设置 selectionMode 标志', () => {
+    const store = useWarehouseStore.getState();
+    expect(store.replenishment.selectionMode).toBe(false);
+
+    store.setSelectionMode(true);
+    expect(useWarehouseStore.getState().replenishment.selectionMode).toBe(true);
+
+    store.setSelectionMode(false);
+    expect(useWarehouseStore.getState().replenishment.selectionMode).toBe(false);
+  });
+
+  it('toggleLocationSelection 应在选中集合中增删单个货位', () => {
+    const store = useWarehouseStore.getState();
+
+    store.toggleLocationSelection('RPL-A1');
+    expect(useWarehouseStore.getState().replenishment.selectedLocationIds).toEqual(['RPL-A1']);
+
+    store.toggleLocationSelection('RPL-A2');
+    expect(useWarehouseStore.getState().replenishment.selectedLocationIds).toEqual(['RPL-A1', 'RPL-A2']);
+
+    store.toggleLocationSelection('RPL-A1');
+    expect(useWarehouseStore.getState().replenishment.selectedLocationIds).toEqual(['RPL-A2']);
+  });
+
+  it('clearLocationSelection 应清空选中但不影响批次', () => {
+    const store = useWarehouseStore.getState();
+    store.toggleLocationSelection('RPL-A1');
+    store.toggleLocationSelection('RPL-A2');
+    store.toggleLocationSelection('RPL-A3');
+
+    store.clearLocationSelection();
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.selectedLocationIds).toEqual([]);
+    expect(s.replenishment.selectionBox).toBeNull();
+    expect(s.locations.length).toBeGreaterThan(0);
+  });
+
+  it('selectLocationsByHeat 应按阈值圈选高热货位，阈值越高选中越少', () => {
+    useWarehouseStore.getState().selectLocationsByHeat(0);
+    const allIds = useWarehouseStore.getState().replenishment.selectedLocationIds;
+    expect(allIds.length).toBeGreaterThanOrEqual(5);
+
+    useWarehouseStore.getState().clearLocationSelection();
+    useWarehouseStore.getState().selectLocationsByHeat(90);
+    const highIds = useWarehouseStore.getState().replenishment.selectedLocationIds;
+    expect(highIds.length).toBeLessThanOrEqual(allIds.length);
+    expect(highIds.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('未选中任何货位时 createBatchFromSelection 应返回 null 不创建', () => {
+    const store = useWarehouseStore.getState();
+    expect(store.replenishment.selectedLocationIds).toEqual([]);
+
+    const result = store.createBatchFromSelection();
+    expect(result).toBeNull();
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.batches).toHaveLength(0);
+    expect(s.replenishment.nextBatchNo).toBe(1);
+  });
+
+  it('createBatchFromSelection 应创建批次并正确分配编号、优先级、顺序、缺口', () => {
+    const store = useWarehouseStore.getState();
+    store.toggleLocationSelection('RPL-A1');
+    store.toggleLocationSelection('RPL-A2');
+    store.toggleLocationSelection('RPL-C1');
+
+    const batch = store.createBatchFromSelection();
+
+    expect(batch).not.toBeNull();
+    expect(batch!.batchNo).toBe('RPL-0001');
+    expect(batch!.name).toBe('补货批次 RPL-0001');
+    expect(['critical', 'high', 'medium', 'low']).toContain(batch!.priority);
+    expect(batch!.status).toBe('draft');
+    expect(batch!.estimatedOrder).toBe(1);
+    expect(batch!.locations.length).toBe(3);
+    expect(batch!.totalShortage).toBeGreaterThan(0);
+    expect(batch!.locations.every((bl) => bl.shortage >= 0 && bl.heatLevel >= 0)).toBe(true);
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.batches).toHaveLength(1);
+    expect(s.replenishment.nextBatchNo).toBe(2);
+    expect(s.replenishment.selectedLocationIds).toEqual([]);
+    expect(s.replenishment.activeBatchId).toBe(batch!.id);
+    expect(s.replenishment.undoStack.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('第二个批次应编号 RPL-0002，处理顺序为 2', () => {
+    const store = useWarehouseStore.getState();
+    store.toggleLocationSelection('RPL-A1');
+    store.createBatchFromSelection();
+
+    store.toggleLocationSelection('RPL-B1');
+    store.toggleLocationSelection('RPL-B2');
+    const batch2 = store.createBatchFromSelection();
+
+    expect(batch2!.batchNo).toBe('RPL-0002');
+    expect(batch2!.estimatedOrder).toBe(2);
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.batches).toHaveLength(2);
+    expect(s.replenishment.nextBatchNo).toBe(3);
+  });
+
+  it('createBatchFromSelection 应支持自定义名称和优先级', () => {
+    const store = useWarehouseStore.getState();
+    store.toggleLocationSelection('RPL-A1');
+    store.toggleLocationSelection('RPL-A2');
+
+    const batch = store.createBatchFromSelection({
+      name: 'A 区紧急补货',
+      priority: 'critical',
+    });
+
+    expect(batch!.name).toBe('A 区紧急补货');
+    expect(batch!.priority).toBe('critical');
+  });
+});
+
+describe('补货任务沙盘: 批次调整、删除与顺序', () => {
+  beforeEach(() => {
+    resetReplenishmentStore();
+    const store = useWarehouseStore.getState();
+    store.toggleLocationSelection('RPL-A1');
+    store.toggleLocationSelection('RPL-A2');
+    store.createBatchFromSelection({ name: '批次一', priority: 'high' });
+
+    store.toggleLocationSelection('RPL-B1');
+    store.toggleLocationSelection('RPL-B2');
+    store.createBatchFromSelection({ name: '批次二', priority: 'medium' });
+
+    store.toggleLocationSelection('RPL-C1');
+    store.toggleLocationSelection('RPL-C2');
+    store.createBatchFromSelection({ name: '批次三', priority: 'low' });
+  });
+
+  it('updateBatch 应更新名称、优先级、状态，撤销栈应记录', () => {
+    const store = useWarehouseStore.getState();
+    const batch = store.replenishment.batches[0];
+    const undoBefore = store.replenishment.undoStack.length;
+
+    store.updateBatch(batch.id, {
+      name: '批次一（已改名）',
+      priority: 'critical',
+      status: 'pending',
+      notes: '这是备注',
+    });
+
+    const s = useWarehouseStore.getState();
+    const updated = s.replenishment.batches.find((b) => b.id === batch.id)!;
+    expect(updated.name).toBe('批次一（已改名）');
+    expect(updated.priority).toBe('critical');
+    expect(updated.status).toBe('pending');
+    expect(updated.notes).toBe('这是备注');
+    expect(updated.updatedAt).not.toBe(updated.createdAt);
+    expect(s.replenishment.undoStack.length).toBe(undoBefore + 1);
+  });
+
+  it('deleteBatch 应删除批次并从撤销栈恢复', () => {
+    const store = useWarehouseStore.getState();
+    expect(store.replenishment.batches).toHaveLength(3);
+    const batch = store.replenishment.batches[1];
+
+    store.deleteBatch(batch.id);
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.batches).toHaveLength(2);
+    expect(s.replenishment.batches.find((b) => b.id === batch.id)).toBeUndefined();
+    expect(s.replenishment.actionLogs.some((l) => l.description.includes(batch.batchNo))).toBe(true);
+  });
+
+  it('adjustBatchOrder 应正确重排顺序，向前移动时其他批次顺延', () => {
+    const store = useWarehouseStore.getState();
+    const ordered = store.getBatchesInProcessingOrder();
+    expect(ordered[0].estimatedOrder).toBe(1);
+    expect(ordered[1].estimatedOrder).toBe(2);
+    expect(ordered[2].estimatedOrder).toBe(3);
+
+    const batch3 = ordered[2];
+    store.adjustBatchOrder(batch3.id, 1);
+
+    const newOrdered = useWarehouseStore.getState().getBatchesInProcessingOrder();
+    expect(newOrdered[0].id).toBe(batch3.id);
+    expect(newOrdered[0].estimatedOrder).toBe(1);
+    expect(newOrdered[1].estimatedOrder).toBe(2);
+    expect(newOrdered[2].estimatedOrder).toBe(3);
+  });
+
+  it('adjustBatchOrder 向后移动时其他批次应前移填补', () => {
+    const store = useWarehouseStore.getState();
+    const ordered = store.getBatchesInProcessingOrder();
+    const batch1 = ordered[0];
+
+    store.adjustBatchOrder(batch1.id, 3);
+
+    const newOrdered = useWarehouseStore.getState().getBatchesInProcessingOrder();
+    expect(newOrdered[2].id).toBe(batch1.id);
+    expect(newOrdered.map((b) => b.estimatedOrder)).toEqual([1, 2, 3]);
+  });
+
+  it('addLocationToBatch 应向批次添加货位并触发更新', () => {
+    const store = useWarehouseStore.getState();
+    const batch = store.replenishment.batches[0];
+    const origLen = batch.locations.length;
+
+    store.addLocationToBatch(batch.id, 'RPL-A3');
+
+    const s = useWarehouseStore.getState();
+    const updated = s.replenishment.batches.find((b) => b.id === batch.id)!;
+    expect(updated.locations.length).toBe(origLen + 1);
+    expect(updated.locations.some((bl) => bl.locationId === 'RPL-A3')).toBe(true);
+  });
+
+  it('addLocationToBatch 添加已被其他批次占用的货位应产生冲突', () => {
+    const store = useWarehouseStore.getState();
+    const batch1 = store.replenishment.batches[0];
+    const locInBatch1 = batch1.locations[0].locationId;
+    const batch2 = store.replenishment.batches[1];
+
+    const conflictBefore = store.replenishment.conflicts.length;
+    store.addLocationToBatch(batch2.id, locInBatch1);
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.conflicts.length).toBeGreaterThan(conflictBefore);
+    const latest = s.replenishment.conflicts[s.replenishment.conflicts.length - 1];
+    expect(latest.type).toBe('location_occupied');
+    expect(latest.locationId).toBe(locInBatch1);
+  });
+
+  it('removeLocationFromBatch 应从批次中移除指定货位', () => {
+    const store = useWarehouseStore.getState();
+    const batch = store.replenishment.batches[0];
+    const locId = batch.locations[0].locationId;
+
+    store.removeLocationFromBatch(batch.id, locId);
+
+    const s = useWarehouseStore.getState();
+    const updated = s.replenishment.batches.find((b) => b.id === batch.id)!;
+    expect(updated.locations.some((bl) => bl.locationId === locId)).toBe(false);
+  });
+
+  it('getBatchesInProcessingOrder 应按顺序+优先级双重排序', () => {
+    const store = useWarehouseStore.getState();
+    const batches = store.replenishment.batches;
+    // 设置两个同 order 但优先级不同 + 一个不同 order 的批次，体现双重排序
+    store.updateBatch(batches[2].id, { priority: 'low', estimatedOrder: 1 });       // order=1 low
+    store.updateBatch(batches[1].id, { priority: 'critical', estimatedOrder: 2 });  // order=2 critical
+    store.updateBatch(batches[0].id, { priority: 'high', estimatedOrder: 2 });      // order=2 high (优先级低于critical)
+
+    const ordered = store.getBatchesInProcessingOrder();
+    expect(ordered[0].id).toBe(batches[2].id); // order=1 最先
+    expect(ordered[1].id).toBe(batches[1].id); // order=2 priority=critical
+    expect(ordered[2].id).toBe(batches[0].id); // order=2 priority=high
+  });
+
+  it('clearReplenishmentBatches 应清空所有批次并保留可撤销能力', () => {
+    const store = useWarehouseStore.getState();
+    expect(store.replenishment.batches.length).toBe(3);
+    const undoBefore = store.replenishment.undoStack.length;
+
+    store.clearReplenishmentBatches();
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.batches).toHaveLength(0);
+    expect(s.replenishment.selectedLocationIds).toEqual([]);
+    expect(s.replenishment.nextBatchNo).toBe(1);
+    expect(s.replenishment.undoStack.length).toBe(undoBefore + 1);
+  });
+
+  it('getLocationOccupancyMap 应返回每个货位对应的批次信息', () => {
+    const store = useWarehouseStore.getState();
+    const map = store.getLocationOccupancyMap();
+
+    for (const batch of store.replenishment.batches) {
+      for (const bl of batch.locations) {
+        expect(map.has(bl.locationId)).toBe(true);
+        expect(map.get(bl.locationId)!.batchId).toBe(batch.id);
+        expect(map.get(bl.locationId)!.batchNo).toBe(batch.batchNo);
+      }
+    }
+  });
+
+  it('创建批次时选中货位若有被占用的应跳过并记录 location_occupied 冲突', () => {
+    const store = useWarehouseStore.getState();
+    const batch1 = store.replenishment.batches[0];
+    const occupied = batch1.locations[0].locationId;
+
+    store.toggleLocationSelection(occupied);
+    store.toggleLocationSelection('RPL-A3');
+
+    const undoBefore = store.replenishment.undoStack.length;
+    const conflictBefore = store.replenishment.conflicts.length;
+    const newBatch = store.createBatchFromSelection();
+
+    expect(newBatch).not.toBeNull();
+    expect(newBatch!.locations.some((bl) => bl.locationId === occupied)).toBe(false);
+    expect(newBatch!.locations.some((bl) => bl.locationId === 'RPL-A3')).toBe(true);
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.conflicts.length).toBeGreaterThan(conflictBefore);
+    expect(s.replenishment.undoStack.length).toBe(undoBefore + 1);
+  });
+});
+
+describe('补货任务沙盘: 导入导出与冲突处理', () => {
+  beforeEach(() => {
+    resetReplenishmentStore();
+    const store = useWarehouseStore.getState();
+    store.toggleLocationSelection('RPL-A1');
+    store.toggleLocationSelection('RPL-A2');
+    store.createBatchFromSelection({ name: '本地批次' });
+  });
+
+  it('导入 null/无效数据应返回 success=false, canUndo=false', () => {
+    const store = useWarehouseStore.getState();
+    const batchesBefore = store.replenishment.batches.length;
+
+    const result = store.importReplenishmentBatches(null);
+    expect(result.success).toBe(false);
+    expect(result.importedBatches).toBe(0);
+    expect(result.canUndo).toBe(false);
+
+    expect(useWarehouseStore.getState().replenishment.batches.length).toBe(batchesBefore);
+  });
+
+  it('导入缺少 batches 字段的数据应返回失败', () => {
+    const store = useWarehouseStore.getState();
+    const result = store.importReplenishmentBatches({ version: 1 });
+    expect(result.success).toBe(false);
+    expect(result.conflicts.some((c) => c.type === 'missing_required_field')).toBe(true);
+  });
+
+  it('导入重复批次编号应自动重命名并产生 duplicate_batch_no 冲突', () => {
+    const store = useWarehouseStore.getState();
+    const existingNo = store.replenishment.batches[0].batchNo;
+
+    const importData = {
+      version: 1,
+      batches: [
+        {
+          id: 'imp-1',
+          batchNo: existingNo,
+          name: '导入重复编号',
+          priority: 'high',
+          status: 'draft',
+          estimatedOrder: 1,
+          locations: [
+            { locationId: 'RPL-B1', currentStock: 10, targetStock: 100, shortage: 90, heatLevel: 60 },
+            { locationId: 'RPL-B2', currentStock: 20, targetStock: 100, shortage: 80, heatLevel: 50 },
+          ],
+          totalShortage: 170,
+          createdAt: '2024-06-01T00:00:00Z',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+      ],
+    };
+
+    const result = store.importReplenishmentBatches(importData);
+    expect(result.success).toBe(true);
+    expect(result.importedBatches).toBe(1);
+    expect(result.conflicts.some((c) => c.type === 'duplicate_batch_no')).toBe(true);
+
+    const s = useWarehouseStore.getState();
+    const imported = s.replenishment.batches.find((b) => b.id === 'imp-1');
+    expect(imported).toBeDefined();
+    expect(imported!.batchNo).not.toBe(existingNo);
+    expect(imported!.batchNo.startsWith(existingNo)).toBe(true);
+  });
+
+  it('导入货位已被现有批次占用应跳过并产生 location_occupied 冲突', () => {
+    const store = useWarehouseStore.getState();
+    const occupied = store.replenishment.batches[0].locations[0].locationId;
+
+    const importData = {
+      version: 1,
+      batches: [
+        {
+          id: 'imp-2',
+          batchNo: 'RPL-9999',
+          name: '导入占用货位',
+          priority: 'medium',
+          status: 'draft',
+          estimatedOrder: 9999,
+          locations: [
+            { locationId: occupied, currentStock: 5, targetStock: 100, shortage: 95, heatLevel: 80 },
+            { locationId: 'RPL-B3', currentStock: 15, targetStock: 100, shortage: 85, heatLevel: 70 },
+          ],
+          totalShortage: 180,
+          createdAt: '2024-06-01T00:00:00Z',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+      ],
+    };
+
+    const result = store.importReplenishmentBatches(importData);
+    expect(result.success).toBe(true);
+    expect(result.importedBatches).toBe(1);
+
+    const imported = useWarehouseStore.getState().replenishment.batches.find((b) => b.id === 'imp-2');
+    expect(imported!.locations.some((bl) => bl.locationId === occupied)).toBe(false);
+    expect(imported!.locations.some((bl) => bl.locationId === 'RPL-B3')).toBe(true);
+
+    const locConflict = result.conflicts.find(
+      (c) => c.type === 'location_occupied' && c.locationId === occupied
+    );
+    expect(locConflict).toBeDefined();
+    expect(locConflict!.resolved).toBe(true);
+    expect(locConflict!.resolution).toBe('skip');
+  });
+
+  it('导入未知货位应跳过并产生 unknown_location 冲突', () => {
+    const store = useWarehouseStore.getState();
+
+    const importData = {
+      version: 1,
+      batches: [
+        {
+          id: 'imp-3',
+          batchNo: 'RPL-8888',
+          name: '含未知货位',
+          priority: 'low',
+          status: 'draft',
+          estimatedOrder: 9999,
+          locations: [
+            { locationId: 'UNKNOWN-999', currentStock: 0, targetStock: 50, shortage: 50, heatLevel: 30 },
+            { locationId: 'RPL-C1', currentStock: 25, targetStock: 100, shortage: 75, heatLevel: 55 },
+          ],
+          totalShortage: 125,
+          createdAt: '2024-06-01T00:00:00Z',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+      ],
+    };
+
+    const result = store.importReplenishmentBatches(importData);
+    expect(result.importedBatches).toBe(1);
+
+    const imported = useWarehouseStore.getState().replenishment.batches.find((b) => b.id === 'imp-3');
+    expect(imported!.locations.map((bl) => bl.locationId)).toEqual(['RPL-C1']);
+    expect(result.conflicts.some((c) => c.type === 'unknown_location')).toBe(true);
+  });
+
+  it('导入批次缺少必填字段应跳过并产生 missing_required_field 冲突', () => {
+    const store = useWarehouseStore.getState();
+
+    const importData = {
+      version: 1,
+      batches: [
+        {
+          id: 'bad-1',
+          name: '缺字段批次',
+        },
+        {
+          id: 'good-1',
+          batchNo: 'RPL-7777',
+          name: '正常批次',
+          priority: 'high',
+          status: 'draft',
+          estimatedOrder: 9999,
+          locations: [
+            { locationId: 'RPL-C2', currentStock: 20, targetStock: 100, shortage: 80, heatLevel: 60 },
+          ],
+          totalShortage: 80,
+          createdAt: '2024-06-01T00:00:00Z',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+      ],
+    };
+
+    const result = store.importReplenishmentBatches(importData);
+    expect(result.importedBatches).toBe(1);
+    expect(result.skippedBatches).toBe(1);
+    expect(result.conflicts.some((c) => c.type === 'missing_required_field')).toBe(true);
+    expect(useWarehouseStore.getState().replenishment.batches.find((b) => b.id === 'bad-1')).toBeUndefined();
+    expect(useWarehouseStore.getState().replenishment.batches.find((b) => b.id === 'good-1')).toBeDefined();
+  });
+
+  it('导入版本不匹配应产生 version_mismatch 冲突但继续导入', () => {
+    const store = useWarehouseStore.getState();
+
+    const importData = {
+      version: 999,
+      batches: [
+        {
+          id: 'ver-1',
+          batchNo: 'RPL-6666',
+          name: '旧版本批次',
+          priority: 'medium',
+          status: 'draft',
+          estimatedOrder: 9999,
+          locations: [
+            { locationId: 'RPL-B3', currentStock: 5, targetStock: 50, shortage: 45, heatLevel: 35 },
+          ],
+          totalShortage: 45,
+          createdAt: '2024-06-01T00:00:00Z',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+      ],
+    };
+
+    const result = store.importReplenishmentBatches(importData);
+    expect(result.success).toBe(true);
+    expect(result.importedBatches).toBe(1);
+    expect(result.conflicts.some((c) => c.type === 'version_mismatch')).toBe(true);
+    expect(useWarehouseStore.getState().replenishment.batches.find((b) => b.id === 'ver-1')).toBeDefined();
+  });
+
+  it('导入成功后 canUndo=true，撤销应回到导入前状态', () => {
+    const store = useWarehouseStore.getState();
+    const batchesBefore = store.replenishment.batches.length;
+
+    const importData = {
+      version: 1,
+      batches: [
+        {
+          id: 'undo-test-1',
+          batchNo: 'RPL-5555',
+          name: '撤销测试',
+          priority: 'high',
+          status: 'draft',
+          estimatedOrder: 9999,
+          locations: [
+            { locationId: 'RPL-B3', currentStock: 10, targetStock: 100, shortage: 90, heatLevel: 80 },
+          ],
+          totalShortage: 90,
+          createdAt: '2024-06-01T00:00:00Z',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+      ],
+    };
+
+    const importResult = store.importReplenishmentBatches(importData);
+    expect(importResult.canUndo).toBe(true);
+    expect(useWarehouseStore.getState().replenishment.batches.length).toBe(batchesBefore + 1);
+
+    const undoSizeBefore = store.getReplenishmentUndoStackSize();
+    const undoResult = store.undoLastReplenishmentAction();
+    expect(undoResult).not.toBeNull();
+    expect(undoResult!.success).toBe(true);
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.batches.length).toBe(batchesBefore);
+    expect(s.replenishment.batches.find((b) => b.id === 'undo-test-1')).toBeUndefined();
+    expect(s.getReplenishmentUndoStackSize()).toBe(undoSizeBefore - 1);
+  });
+
+  it('导入文件内货位重复出现应跳过重复项', () => {
+    const store = useWarehouseStore.getState();
+    const importData = {
+      version: 1,
+      batches: [
+        {
+          id: 'dup-loc-1',
+          batchNo: 'RPL-4444',
+          name: '批次一',
+          priority: 'high',
+          status: 'draft',
+          estimatedOrder: 9999,
+          locations: [
+            { locationId: 'RPL-B1', currentStock: 10, targetStock: 100, shortage: 90, heatLevel: 70 },
+          ],
+          totalShortage: 90,
+          createdAt: '2024-06-01T00:00:00Z',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+        {
+          id: 'dup-loc-2',
+          batchNo: 'RPL-4445',
+          name: '批次二',
+          priority: 'medium',
+          status: 'draft',
+          estimatedOrder: 9999,
+          locations: [
+            { locationId: 'RPL-B1', currentStock: 5, targetStock: 50, shortage: 45, heatLevel: 60 },
+            { locationId: 'RPL-B3', currentStock: 0, targetStock: 50, shortage: 50, heatLevel: 50 },
+          ],
+          totalShortage: 95,
+          createdAt: '2024-06-01T00:00:00Z',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+      ],
+    };
+
+    const result = store.importReplenishmentBatches(importData);
+    expect(result.importedBatches).toBe(2);
+
+    const s = useWarehouseStore.getState();
+    const b1 = s.replenishment.batches.find((b) => b.id === 'dup-loc-1')!;
+    const b2 = s.replenishment.batches.find((b) => b.id === 'dup-loc-2')!;
+    expect(b1.locations.map((l) => l.locationId)).toContain('RPL-B1');
+    expect(b2.locations.map((l) => l.locationId)).not.toContain('RPL-B1');
+    expect(b2.locations.map((l) => l.locationId)).toContain('RPL-B3');
+
+    expect(result.conflicts.some((c) => c.type === 'location_occupied' && c.locationId === 'RPL-B1')).toBe(true);
+  });
+
+  it('应记录 import 类型的操作日志，包含成功/跳过/冲突统计', () => {
+    const store = useWarehouseStore.getState();
+    const importData = {
+      version: 1,
+      batches: [
+        {
+          id: 'log-test-1',
+          batchNo: 'RPL-3333',
+          name: '日志测试批次',
+          priority: 'low',
+          status: 'draft',
+          estimatedOrder: 9999,
+          locations: [
+            { locationId: 'RPL-B3', currentStock: 10, targetStock: 100, shortage: 90, heatLevel: 75 },
+          ],
+          totalShortage: 90,
+          createdAt: '2024-06-01T00:00:00Z',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+      ],
+    };
+
+    store.importReplenishmentBatches(importData);
+    const logs = useWarehouseStore.getState().replenishment.actionLogs;
+    const importLog = logs.find((l) => l.action === 'import');
+    expect(importLog).toBeDefined();
+    expect(typeof importLog!.description).toBe('string');
+  });
+});
+
+describe('补货任务沙盘: 草稿持久化与撤销', () => {
+  beforeEach(() => {
+    resetReplenishmentStore();
+    localStorage.clear();
+  });
+
+  it('saveReplenishmentDraft 应写入 localStorage key replenishment-draft', () => {
+    const store = useWarehouseStore.getState();
+    store.toggleLocationSelection('RPL-A1');
+    store.createBatchFromSelection({ name: '草稿批次' });
+
+    store.saveReplenishmentDraft();
+    const raw = localStorage.getItem('replenishment-draft');
+    expect(raw).not.toBeNull();
+
+    const parsed = JSON.parse(raw!);
+    expect(parsed.version).toBe(1);
+    expect(Array.isArray(parsed.batches)).toBe(true);
+    expect(parsed.batches.length).toBe(1);
+    expect(typeof parsed.savedAt).toBe('string');
+    expect(parsed.batches[0].name).toBe('草稿批次');
+  });
+
+  it('loadReplenishmentDraft 应从 localStorage 恢复批次和 nextBatchNo', () => {
+    const store = useWarehouseStore.getState();
+    store.toggleLocationSelection('RPL-A1');
+    store.toggleLocationSelection('RPL-B2');
+    store.createBatchFromSelection({ name: '恢复测试批次', priority: 'critical' });
+    store.saveReplenishmentDraft();
+
+    resetReplenishmentStore();
+    expect(useWarehouseStore.getState().replenishment.batches).toHaveLength(0);
+
+    const loaded = useWarehouseStore.getState().loadReplenishmentDraft();
+    expect(loaded).toBe(true);
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.batches).toHaveLength(1);
+    expect(s.replenishment.batches[0].name).toBe('恢复测试批次');
+    expect(s.replenishment.batches[0].priority).toBe('critical');
+    expect(s.replenishment.lastAutoSavedAt).not.toBeNull();
+  });
+
+  it('localStorage 为空时 loadReplenishmentDraft 应返回 false 不抛错', () => {
+    localStorage.clear();
+    const loaded = useWarehouseStore.getState().loadReplenishmentDraft();
+    expect(loaded).toBe(false);
+    expect(useWarehouseStore.getState().replenishment.batches).toHaveLength(0);
+  });
+
+  it('刷新/重启链路: persist 应持久化 batches、nextBatchNo、undoStack(限5层)、conflicts', () => {
+    const s1 = useWarehouseStore.getState();
+    s1.toggleLocationSelection('RPL-A1');
+    s1.toggleLocationSelection('RPL-A2');
+    const batch1 = s1.createBatchFromSelection();
+    expect(batch1).not.toBeNull();
+    expect(useWarehouseStore.getState().replenishment.batches).toHaveLength(1);
+
+    useWarehouseStore.getState().toggleLocationSelection('RPL-B1');
+    const batch2 = useWarehouseStore.getState().createBatchFromSelection();
+    expect(batch2).not.toBeNull();
+
+    useWarehouseStore.getState().updateBatch(batch1!.id, { name: '持久化测试' });
+
+    const afterState = useWarehouseStore.getState();
+    expect(afterState.replenishment.batches.length).toBe(2);
+
+    expect(Array.isArray(afterState.replenishment.batches)).toBe(true);
+    expect(afterState.replenishment.batches.length).toBe(2);
+    expect(typeof afterState.replenishment.nextBatchNo).toBe('number');
+    expect(afterState.replenishment.nextBatchNo).toBe(3);
+    expect(Array.isArray(afterState.replenishment.undoStack)).toBe(true);
+    expect(afterState.replenishment.undoStack.length).toBeLessThanOrEqual(20);
+    expect(Array.isArray(afterState.replenishment.conflicts)).toBe(true);
+    expect(typeof afterState.replenishment.autoSaveEnabled).toBe('boolean');
+  });
+
+  it('rehydrate 时缺少 replenishment 应补默认结构', () => {
+    const baseState = useWarehouseStore.getState();
+    expect(baseState.replenishment).toBeDefined();
+    expect(Array.isArray(baseState.replenishment.batches)).toBe(true);
+    expect(baseState.replenishment.batches).toHaveLength(0);
+    expect(typeof baseState.replenishment.nextBatchNo).toBe('number');
+    expect(baseState.replenishment.nextBatchNo).toBeGreaterThanOrEqual(1);
+    expect(typeof baseState.replenishment.autoSaveEnabled).toBe('boolean');
+    expect(Array.isArray(baseState.replenishment.conflicts)).toBe(true);
+    expect(Array.isArray(baseState.replenishment.actionLogs)).toBe(true);
+    expect(Array.isArray(baseState.replenishment.undoStack)).toBe(true);
+    expect(Array.isArray(baseState.replenishment.selectedLocationIds)).toBe(true);
+    expect(typeof baseState.replenishment.selectionMode).toBe('boolean');
+  });
+
+  it('撤销栈为空时 undoLastReplenishmentAction 应返回 null', () => {
+    const store = useWarehouseStore.getState();
+    expect(store.getReplenishmentUndoStackSize()).toBe(0);
+
+    const result = store.undoLastReplenishmentAction();
+    expect(result).toBeNull();
+  });
+
+  it('创建批次后撤销应回到批次创建之前的状态', () => {
+    useWarehouseStore.getState().toggleLocationSelection('RPL-A1');
+    const batch = useWarehouseStore.getState().createBatchFromSelection();
+    expect(batch).not.toBeNull();
+    expect(useWarehouseStore.getState().replenishment.batches).toHaveLength(1);
+
+    const undoResult = useWarehouseStore.getState().undoLastReplenishmentAction();
+    expect(undoResult).not.toBeNull();
+    expect(undoResult!.success).toBe(true);
+
+    const s = useWarehouseStore.getState();
+    expect(s.replenishment.batches).toHaveLength(0);
+    expect(s.replenishment.actionLogs.some((l) => l.description.includes('撤销'))).toBe(true);
+  });
+
+  it('删除批次后撤销应恢复被删除的批次', () => {
+    useWarehouseStore.getState().toggleLocationSelection('RPL-A1');
+    const created = useWarehouseStore.getState().createBatchFromSelection({ name: '恢复我' });
+    expect(created).not.toBeNull();
+    const batchId = created!.id;
+    expect(useWarehouseStore.getState().replenishment.batches.find((b) => b.id === batchId)).toBeDefined();
+
+    useWarehouseStore.getState().deleteBatch(batchId);
+    expect(useWarehouseStore.getState().replenishment.batches.find((b) => b.id === batchId)).toBeUndefined();
+
+    useWarehouseStore.getState().undoLastReplenishmentAction();
+    const restored = useWarehouseStore.getState().replenishment.batches.find((b) => b.id === batchId);
+    expect(restored).toBeDefined();
+    expect(restored!.name).toBe('恢复我');
+  });
+
+  it('调整顺序后撤销应恢复原顺序', () => {
+    const store = useWarehouseStore.getState();
+    store.toggleLocationSelection('RPL-A1');
+    store.createBatchFromSelection();
+    store.toggleLocationSelection('RPL-B1');
+    store.createBatchFromSelection();
+    const orderedBefore = store.getBatchesInProcessingOrder().map((b) => b.id);
+
+    store.adjustBatchOrder(orderedBefore[1], 1);
+    const orderedAfter = store.getBatchesInProcessingOrder().map((b) => b.id);
+    expect(orderedAfter).not.toEqual(orderedBefore);
+
+    store.undoLastReplenishmentAction();
+    const restored = store.getBatchesInProcessingOrder().map((b) => b.id);
+    expect(restored).toEqual(orderedBefore);
+  });
+
+  it('连续多次操作撤销栈应保留最近 N 步，getReplenishmentUndoStackSize 反映', () => {
+    const store = useWarehouseStore.getState();
+    const locs = ['RPL-A1', 'RPL-A2', 'RPL-B1', 'RPL-B2', 'RPL-C1', 'RPL-C2'];
+    for (let i = 0; i < locs.length; i++) {
+      store.toggleLocationSelection(locs[i]);
+      store.createBatchFromSelection();
+    }
+
+    const size = store.getReplenishmentUndoStackSize();
+    expect(size).toBeGreaterThanOrEqual(6);
+
+    for (let i = 0; i < 3; i++) {
+      store.undoLastReplenishmentAction();
+    }
+    expect(store.getReplenishmentUndoStackSize()).toBe(size - 3);
+  });
+
+  it('setAutoSaveEnabled 应切换自动保存开关', () => {
+    const store = useWarehouseStore.getState();
+    expect(store.replenishment.autoSaveEnabled).toBe(false);
+
+    store.setAutoSaveEnabled(true);
+    expect(useWarehouseStore.getState().replenishment.autoSaveEnabled).toBe(true);
+
+    store.setAutoSaveEnabled(false);
+    expect(useWarehouseStore.getState().replenishment.autoSaveEnabled).toBe(false);
+  });
+
+  it('clearReplenishmentConflicts 应清空冲突列表', () => {
+    useWarehouseStore.setState((s: any) => ({
+      replenishment: {
+        ...s.replenishment,
+        conflicts: [
+          { type: 'duplicate_batch_no', message: 'test', resolved: false },
+          { type: 'location_occupied', message: 'test2', resolved: true },
+        ],
+      },
+    }));
+    expect(useWarehouseStore.getState().replenishment.conflicts.length).toBe(2);
+
+    useWarehouseStore.getState().clearReplenishmentConflicts();
+    expect(useWarehouseStore.getState().replenishment.conflicts).toHaveLength(0);
+  });
+
+  it('clearReplenishmentLogs 应清空操作日志列表', () => {
+    useWarehouseStore.getState().addReplenishmentActionLog('create', '测试日志一');
+    useWarehouseStore.getState().addReplenishmentActionLog('delete', '测试日志二');
+    expect(useWarehouseStore.getState().replenishment.actionLogs.length).toBeGreaterThanOrEqual(2);
+
+    useWarehouseStore.getState().clearReplenishmentLogs();
+    expect(useWarehouseStore.getState().replenishment.actionLogs).toHaveLength(0);
+  });
+});
+
+describe('补货任务沙盘: computeBatchLocationShortage 与缺口估算', () => {
+  beforeEach(() => {
+    resetReplenishmentStore();
+  });
+
+  it('computeBatchLocationShortage 对每个有效货位应返回合理的缺口值', () => {
+    const store = useWarehouseStore.getState();
+    const result = store.computeBatchLocationShortage('RPL-A1', 0);
+
+    expect(result.locationId).toBe('RPL-A1');
+    expect(typeof result.currentStock).toBe('number');
+    expect(typeof result.targetStock).toBe('number');
+    expect(typeof result.shortage).toBe('number');
+    expect(typeof result.heatLevel).toBe('number');
+    expect(result.currentStock).toBeGreaterThanOrEqual(0);
+    expect(result.targetStock).toBeGreaterThan(0);
+    expect(result.shortage).toBeGreaterThanOrEqual(0);
+    expect(result.heatLevel).toBeGreaterThanOrEqual(0);
+    expect(result.heatLevel).toBeLessThanOrEqual(100);
+  });
+
+  it('高热货位的缺口应大于等于低热货位的缺口（平均趋势）', () => {
+    const store = useWarehouseStore.getState();
+    const heat = store.getHeatMap();
+    const counts = [...heat.entries()].map(([id, v]) => ({ id, count: v.count }));
+    counts.sort((a, b) => b.count - a.count);
+
+    if (counts.length >= 2) {
+      const highLoc = counts[0].id;
+      const lowLoc = counts[counts.length - 1].id;
+      const rHigh = store.computeBatchLocationShortage(highLoc, 0);
+      const rLow = store.computeBatchLocationShortage(lowLoc, 0);
+      expect(rHigh.heatLevel).toBeGreaterThanOrEqual(rLow.heatLevel);
+    }
   });
 });
 
