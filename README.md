@@ -286,11 +286,14 @@ src/
 │       ├── DemoPresets.tsx         # 演示预设装载面板
 │       ├── PlaybackLog.tsx         # 导入/操作日志面板
 │       ├── SnapshotArchive.tsx     # 快照归档中心面板（新增）
+│       ├── ReplenishmentSandbox.tsx # 补货任务沙盘面板（新增）
 │       ├── DataImporter.tsx        # 数据导入（布局/拣货/快照）
 │       ├── BookmarkPanel.tsx       # 相机书签管理
 │       ├── FilterPanel.tsx         # 筛选条件
 │       ├── ThresholdPanel.tsx      # 色阶阈值
 │       └── AnomalyPanel.tsx        # 异常检测结果
+├── 3d/
+│   └── LocationBox.tsx             # 3D 货位交互（含圈选/占用颜色编码）
 ├── pages/
 │   ├── Home.tsx                    # 主页 (pageId: home，含启动自动恢复)
 │   └── Playback.tsx                # 验收回放台 (pageId: playback，含启动自动恢复)

@@ -284,3 +284,170 @@ export interface ReplenishmentExportData {
     priorityBreakdown: Record<BatchPriority, number>;
   };
 }
+
+export type ShiftType = 'morning' | 'afternoon' | 'night' | 'all';
+
+export interface TimeRange {
+  start: string;
+  end: string;
+}
+
+export interface CongestionFilter {
+  shift: ShiftType;
+  timeRange: TimeRange | null;
+  zones: string[];
+  minCongestionLevel: number;
+}
+
+export interface RoutePoint {
+  id: string;
+  locationId: string | null;
+  x: number;
+  y: number;
+  z: number;
+  type: 'pickup' | 'dropoff' | 'waypoint' | 'congestion';
+  waitTime?: number;
+}
+
+export interface CongestionHotspot {
+  id: string;
+  zone: string;
+  row: number;
+  col: number;
+  layer: number;
+  centerX: number;
+  centerY: number;
+  centerZ: number;
+  severity: number;
+  affectedLocationIds: string[];
+  estimatedWaitTime: number;
+  throughput: number;
+}
+
+export type PlanStatus = 'draft' | 'reviewing' | 'approved' | 'rejected' | 'archived';
+
+export type PlanPriority = 'critical' | 'high' | 'medium' | 'low';
+
+export type PlanSource = 'auto-generated' | 'manual' | 'imported' | 'template';
+
+export interface AffectedLocation {
+  locationId: string;
+  beforeWaitTime: number;
+  afterWaitTime: number;
+  improvement: number;
+  locked: boolean;
+}
+
+export interface CongestionPlan {
+  id: string;
+  planNo: string;
+  name: string;
+  source: PlanSource;
+  priority: PlanPriority;
+  status: PlanStatus;
+  createdAt: string;
+  updatedAt: string;
+  notes?: string;
+  route: RoutePoint[];
+  hotspots: CongestionHotspot[];
+  affectedLocations: AffectedLocation[];
+  metrics: {
+    totalWaitTimeBefore: number;
+    totalWaitTimeAfter: number;
+    avgWaitTimeBefore: number;
+    avgWaitTimeAfter: number;
+    maxWaitTimeBefore: number;
+    maxWaitTimeAfter: number;
+    totalHotspotsBefore: number;
+    totalHotspotsAfter: number;
+    affectedLocationsCount: number;
+    improvedLocationsCount: number;
+    estimatedThroughputGain: number;
+    routeDistance: number;
+  };
+  lockedLocationIds: string[];
+  generationParams?: {
+    algorithm: string;
+    shift: ShiftType;
+    timeRange: TimeRange | null;
+    targetImprovement: number;
+  };
+}
+
+export type CongestionConflictType =
+  | 'duplicate_plan_no'
+  | 'duplicate_plan_name'
+  | 'missing_route_point'
+  | 'unknown_location'
+  | 'location_occupied'
+  | 'missing_required_field'
+  | 'version_mismatch'
+  | 'invalid_route';
+
+export interface CongestionConflict {
+  type: CongestionConflictType;
+  message: string;
+  details?: Record<string, unknown>;
+  planNo?: string;
+  planId?: string;
+  locationId?: string;
+  pointId?: string;
+  resolved?: boolean;
+  resolution?: 'skip' | 'rename' | 'overwrite' | 'merge' | 'fix';
+}
+
+export interface CongestionImportResult {
+  success: boolean;
+  importedPlans: number;
+  skippedPlans: number;
+  conflicts: CongestionConflict[];
+  warnings: string[];
+  canUndo: boolean;
+  actionId?: string;
+}
+
+export interface CongestionActionRecord {
+  id: string;
+  timestamp: string;
+  action: 'create' | 'update' | 'delete' | 'import' | 'generate' | 'lock' | 'unlock' | 'adjust_priority' | 'merge' | 'split';
+  description: string;
+  details?: Record<string, unknown>;
+  previousPlans?: CongestionPlan[];
+}
+
+export interface CongestionSandboxState {
+  plans: CongestionPlan[];
+  activePlanId: string | null;
+  comparePlanId: string | null;
+  filter: CongestionFilter;
+  selectedHotspotIds: string[];
+  conflicts: CongestionConflict[];
+  actionLogs: CongestionActionRecord[];
+  undoStack: Array<{
+    actionId: string;
+    plans: CongestionPlan[];
+    timestamp: string;
+    description: string;
+  }>;
+  nextPlanNo: number;
+  autoSaveEnabled: boolean;
+  lastAutoSavedAt: string | null;
+  importSession: {
+    previousPlans: CongestionPlan[];
+    actionId: string;
+  } | null;
+  showComparison: boolean;
+}
+
+export interface CongestionExportData {
+  version: 1;
+  exportedAt: string;
+  plans: CongestionPlan[];
+  summary: {
+    totalPlans: number;
+    statusBreakdown: Record<PlanStatus, number>;
+    priorityBreakdown: Record<PlanPriority, number>;
+    totalHotspots: number;
+    totalAffectedLocations: number;
+  };
+}

@@ -5,6 +5,7 @@ import { EffectComposer, Bloom } from '@react-three/postprocessing';
 import * as THREE from 'three';
 import { useWarehouseStore } from '@/store/warehouseStore';
 import ShelfGroup from './ShelfGroup';
+import CongestionOverlay from './CongestionOverlay';
 
 function CameraController() {
   const controlsRef = useRef<any>(null);
@@ -151,6 +152,7 @@ export default function WarehouseScene() {
 
       <ShelfGroup />
       <ZoneLabels />
+      <CongestionOverlay />
 
       <EffectComposer>
         <Bloom

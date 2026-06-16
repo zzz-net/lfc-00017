@@ -7,6 +7,7 @@ import { useWarehouseStore } from '@/store/warehouseStore';
 export default function Home() {
   const restoreLatestOnStartup = useWarehouseStore((s) => s.restoreLatestOnStartup);
   const loadReplenishmentDraft = useWarehouseStore((s) => s.loadReplenishmentDraft);
+  const loadCongestionDraft = useWarehouseStore((s) => s.loadCongestionDraft);
 
   useEffect(() => {
     document.title = '主页 - 仓储 3D 热力图';
@@ -19,11 +20,15 @@ export default function Home() {
     const draftTimer = setTimeout(() => {
       loadReplenishmentDraft();
     }, 200);
+    const congestionDraftTimer = setTimeout(() => {
+      loadCongestionDraft();
+    }, 250);
     return () => {
       clearTimeout(timer);
       clearTimeout(draftTimer);
+      clearTimeout(congestionDraftTimer);
     };
-  }, [restoreLatestOnStartup, loadReplenishmentDraft]);
+  }, [restoreLatestOnStartup, loadReplenishmentDraft, loadCongestionDraft]);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#0a0f1a] flex-col">

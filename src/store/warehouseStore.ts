@@ -29,6 +29,22 @@ import type {
   SelectionBox,
   ReplenishmentSandboxState,
   ReplenishmentExportData,
+  ShiftType,
+  TimeRange,
+  CongestionFilter,
+  RoutePoint,
+  CongestionHotspot,
+  PlanStatus,
+  PlanPriority,
+  PlanSource,
+  AffectedLocation,
+  CongestionPlan,
+  CongestionConflictType,
+  CongestionConflict,
+  CongestionImportResult,
+  CongestionActionRecord,
+  CongestionSandboxState,
+  CongestionExportData,
 } from '@/types/warehouse';
 import { sampleLocations, samplePickRecords } from '@/data/sampleData';
 import { getPresetById } from '@/data/demoPresets';
@@ -390,6 +406,456 @@ function computeHeatMap(
   return result;
 }
 
+function detectCongestionHotspots(
+  locations: Location[],
+  pickRecords: PickRecord[],
+  filter: CongestionFilter
+): CongestionHotspot[] {
+  const hotspots: CongestionHotspot[] = [];
+  const countMap = new Map<string, number>();
+
+  let filtered = pickRecords;
+  if (filter.timeRange) {
+    const start = new Date(filter.timeRange.start).getTime();
+    const end = new Date(filter.timeRange.end).getTime();
+    filtered = filtered.filter((r) => {
+      const t = new Date(r.timestamp).getTime();
+      return t >= start && t <= end;
+    });
+  }
+
+  if (filter.shift !== 'all') {
+    const shiftHours: Record<ShiftType, [number, number]> = {
+      morning: [6, 14],
+      afternoon: [14, 22],
+      night: [22, 6],
+      all: [0, 24],
+    };
+    const [startHour, endHour] = shiftHours[filter.shift];
+    filtered = filtered.filter((r) => {
+      const hour = new Date(r.timestamp).getHours();
+      if (startHour < endHour) {
+        return hour >= startHour && hour < endHour;
+      } else {
+        return hour >= startHour || hour < endHour;
+      }
+    });
+  }
+
+  const zoneLocs = filter.zones.length > 0
+    ? new Set(locations.filter((l) => filter.zones.includes(l.zone)).map((l) => l.id))
+    : null;
+  if (zoneLocs) {
+    filtered = filtered.filter((r) => zoneLocs.has(r.locationId));
+  }
+
+  for (const rec of filtered) {
+    countMap.set(rec.locationId, (countMap.get(rec.locationId) || 0) + rec.quantity);
+  }
+
+  const locMap = new Map(locations.map((l) => [l.id, l]));
+  const zoneRows = new Map<string, Map<number, Location[]>>();
+
+  for (const loc of locations) {
+    if (zoneLocs && !zoneLocs.has(loc.id)) continue;
+    if (!zoneRows.has(loc.zone)) zoneRows.set(loc.zone, new Map());
+    const rowMap = zoneRows.get(loc.zone)!;
+    if (!rowMap.has(loc.row)) rowMap.set(loc.row, []);
+    rowMap.get(loc.row)!.push(loc);
+  }
+
+  let hotspotId = 0;
+  for (const [zone, rowMap] of zoneRows) {
+    for (const [row, rowLocs] of rowMap) {
+      const cols = [...new Set(rowLocs.map((l) => l.col))].sort((a, b) => a - b);
+      const layers = [...new Set(rowLocs.map((l) => l.layer))].sort((a, b) => a - b);
+
+      for (let ci = 0; ci < cols.length; ci++) {
+        const col = cols[ci];
+        const colLocs = rowLocs.filter((l) => l.col === col);
+        const totalPick = colLocs.reduce((sum, l) => sum + (countMap.get(l.id) || 0), 0);
+        const severity = colLocs.length > 0 ? totalPick / colLocs.length : 0;
+
+        if (severity >= filter.minCongestionLevel) {
+          const centerX = colLocs.reduce((s, l) => s + l.x, 0) / colLocs.length;
+          const centerY = colLocs.reduce((s, l) => s + l.y, 0) / colLocs.length;
+          const centerZ = colLocs.reduce((s, l) => s + l.z, 0) / colLocs.length;
+
+          hotspots.push({
+            id: `hotspot-${++hotspotId}`,
+            zone,
+            row,
+            col,
+            layer: layers[0],
+            centerX,
+            centerY,
+            centerZ,
+            severity: Math.min(100, severity),
+            affectedLocationIds: colLocs.map((l) => l.id),
+            estimatedWaitTime: Math.round(severity * 1.5),
+            throughput: Math.round(totalPick),
+          });
+        }
+      }
+    }
+  }
+
+  return hotspots.sort((a, b) => b.severity - a.severity);
+}
+
+function calculateRouteDistance(points: RoutePoint[]): number {
+  let distance = 0;
+  for (let i = 1; i < points.length; i++) {
+    const dx = points[i].x - points[i - 1].x;
+    const dy = points[i].y - points[i - 1].y;
+    const dz = points[i].z - points[i - 1].z;
+    distance += Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+  return distance;
+}
+
+function generateRouteFromHotspots(
+  hotspots: CongestionHotspot[],
+  locations: Location[],
+  strategy: 'shortest' | 'balanced' | 'thorough'
+): RoutePoint[] {
+  const points: RoutePoint[] = [];
+  const sortedHotspots = [...hotspots];
+
+  if (strategy === 'shortest') {
+    sortedHotspots.sort((a, b) => a.centerX + a.centerZ - (b.centerX + b.centerZ));
+  } else if (strategy === 'thorough') {
+    sortedHotspots.sort((a, b) => b.severity - a.severity);
+  }
+
+  if (locations.length > 0) {
+    const entryLoc = locations.reduce(
+      (best, l) => (l.x + l.z < best.x + best.z ? l : best),
+      locations[0]
+    );
+    points.push({
+      id: 'route-start',
+      locationId: entryLoc.id,
+      x: entryLoc.x,
+      y: entryLoc.y,
+      z: entryLoc.z - 2,
+      type: 'pickup',
+      waitTime: 0,
+    });
+  }
+
+  for (let i = 0; i < sortedHotspots.length; i++) {
+    const hs = sortedHotspots[i];
+    points.push({
+      id: `hs-${hs.id}`,
+      locationId: hs.affectedLocationIds[0] || null,
+      x: hs.centerX,
+      y: hs.centerY,
+      z: hs.centerZ,
+      type: 'congestion',
+      waitTime: hs.estimatedWaitTime,
+    });
+
+    if (strategy === 'thorough' && hs.affectedLocationIds.length > 1) {
+      const midLocId = hs.affectedLocationIds[Math.floor(hs.affectedLocationIds.length / 2)];
+      const midLoc = locations.find((l) => l.id === midLocId);
+      if (midLoc) {
+        points.push({
+          id: `wp-${hs.id}-${i}`,
+          locationId: midLoc.id,
+          x: midLoc.x,
+          y: midLoc.y,
+          z: midLoc.z,
+          type: 'waypoint',
+          waitTime: Math.round(hs.estimatedWaitTime * 0.3),
+        });
+      }
+    }
+  }
+
+  if (locations.length > 0) {
+    const exitLoc = locations.reduce(
+      (best, l) => (l.x + l.z > best.x + best.z ? l : best),
+      locations[0]
+    );
+    points.push({
+      id: 'route-end',
+      locationId: exitLoc.id,
+      x: exitLoc.x,
+      y: exitLoc.y,
+      z: exitLoc.z + 2,
+      type: 'dropoff',
+      waitTime: 0,
+    });
+  }
+
+  return points;
+}
+
+function computePlanMetrics(
+  hotspots: CongestionHotspot[],
+  route: RoutePoint[],
+  affectedLocations: AffectedLocation[]
+): CongestionPlan['metrics'] {
+  const beforeWaitTimes = affectedLocations.map((a) => a.beforeWaitTime);
+  const afterWaitTimes = affectedLocations.map((a) => a.afterWaitTime);
+
+  const totalWaitTimeBefore = beforeWaitTimes.reduce((s, t) => s + t, 0);
+  const totalWaitTimeAfter = afterWaitTimes.reduce((s, t) => s + t, 0);
+  const avgWaitTimeBefore = beforeWaitTimes.length > 0 ? totalWaitTimeBefore / beforeWaitTimes.length : 0;
+  const avgWaitTimeAfter = afterWaitTimes.length > 0 ? totalWaitTimeAfter / afterWaitTimes.length : 0;
+  const maxWaitTimeBefore = beforeWaitTimes.length > 0 ? Math.max(...beforeWaitTimes) : 0;
+  const maxWaitTimeAfter = afterWaitTimes.length > 0 ? Math.max(...afterWaitTimes) : 0;
+
+  const improvedCount = affectedLocations.filter((a) => a.improvement > 0).length;
+  const throughputGain = totalWaitTimeBefore > 0
+    ? Math.round(((totalWaitTimeBefore - totalWaitTimeAfter) / totalWaitTimeBefore) * 100)
+    : 0;
+
+  return {
+    totalWaitTimeBefore: Math.round(totalWaitTimeBefore),
+    totalWaitTimeAfter: Math.round(totalWaitTimeAfter),
+    avgWaitTimeBefore: Math.round(avgWaitTimeBefore * 10) / 10,
+    avgWaitTimeAfter: Math.round(avgWaitTimeAfter * 10) / 10,
+    maxWaitTimeBefore: Math.round(maxWaitTimeBefore),
+    maxWaitTimeAfter: Math.round(maxWaitTimeAfter),
+    totalHotspotsBefore: hotspots.length,
+    totalHotspotsAfter: Math.max(0, Math.round(hotspots.length * (1 - throughputGain / 200))),
+    affectedLocationsCount: affectedLocations.length,
+    improvedLocationsCount: improvedCount,
+    estimatedThroughputGain: throughputGain,
+    routeDistance: Math.round(calculateRouteDistance(route) * 10) / 10,
+  };
+}
+
+function generateAffectedLocations(
+  hotspots: CongestionHotspot[],
+  locations: Location[],
+  improvementFactor: number
+): AffectedLocation[] {
+  const affected: AffectedLocation[] = [];
+  const allAffectedIds = new Set<string>();
+
+  for (const hs of hotspots) {
+    for (const locId of hs.affectedLocationIds) {
+      allAffectedIds.add(locId);
+    }
+  }
+
+  for (const locId of allAffectedIds) {
+    const loc = locations.find((l) => l.id === locId);
+    if (!loc) continue;
+
+    const hotspot = hotspots.find((h) => h.affectedLocationIds.includes(locId));
+    const beforeWait = hotspot?.estimatedWaitTime || 0;
+    const improvement = Math.min(beforeWait * improvementFactor, beforeWait * 0.8);
+    const afterWait = Math.max(0, beforeWait - improvement);
+
+    affected.push({
+      locationId: locId,
+      beforeWaitTime: Math.round(beforeWait),
+      afterWaitTime: Math.round(afterWait),
+      improvement: Math.round(improvement),
+      locked: false,
+    });
+  }
+
+  return affected.sort((a, b) => b.improvement - a.improvement);
+}
+
+function validateAndNormalizeCongestionData(
+  data: Record<string, unknown>
+): { plans: CongestionPlan[]; conflicts: CongestionConflict[]; warnings: string[] } {
+  const conflicts: CongestionConflict[] = [];
+  const warnings: string[] = [];
+
+  if (data.version !== 1) {
+    conflicts.push({
+      type: 'version_mismatch',
+      message: `导入数据版本 ${data.version} 与当前版本 1 不匹配，尝试兼容导入`,
+      details: { importedVersion: data.version, currentVersion: 1 },
+      resolved: true,
+      resolution: 'merge',
+    });
+    warnings.push(`版本不匹配: v${data.version}，以兼容模式处理`);
+  }
+
+  const plansRaw = data.plans;
+  if (!Array.isArray(plansRaw)) {
+    conflicts.push({
+      type: 'missing_required_field',
+      message: '缺少必填字段 plans',
+      details: { field: 'plans' },
+      resolved: false,
+    });
+    return { plans: [], conflicts, warnings };
+  }
+
+  const plans: CongestionPlan[] = [];
+  const requiredPlanFields = ['id', 'planNo', 'name', 'route', 'hotspots', 'affectedLocations', 'metrics'] as const;
+
+  for (let i = 0; i < plansRaw.length; i++) {
+    const raw = plansRaw[i] as Record<string, unknown>;
+    const missingFields: string[] = [];
+
+    for (const field of requiredPlanFields) {
+      if (!(field in raw)) {
+        missingFields.push(field);
+      }
+    }
+
+    if (missingFields.length > 0) {
+      conflicts.push({
+        type: 'missing_required_field',
+        message: `第 ${i + 1} 个方案缺少必填字段: ${missingFields.join(', ')}，已跳过`,
+        details: { index: i, missingFields },
+        resolved: true,
+        resolution: 'skip',
+      });
+      warnings.push(`方案 #${i + 1} 缺字段: ${missingFields.join(', ')}，跳过`);
+      continue;
+    }
+
+    if (!Array.isArray(raw.route) || raw.route.length === 0) {
+      conflicts.push({
+        type: 'invalid_route',
+        message: `方案 ${raw.planNo} 路线为空或格式无效`,
+        planNo: String(raw.planNo),
+        details: { reason: 'empty_route' },
+        resolved: true,
+        resolution: 'skip',
+      });
+      continue;
+    }
+
+    const validRoute: RoutePoint[] = [];
+    for (let j = 0; j < (raw.route as unknown[]).length; j++) {
+      const rp = raw.route[j] as Record<string, unknown>;
+      if (!rp || typeof rp !== 'object') continue;
+      if (typeof rp.x !== 'number' || typeof rp.y !== 'number' || typeof rp.z !== 'number') {
+        conflicts.push({
+          type: 'missing_route_point',
+          message: `方案 ${raw.planNo} 第 ${j + 1} 个路线点缺少坐标，已跳过`,
+          planNo: String(raw.planNo),
+          pointId: String(rp.id ?? `point-${j}`),
+          details: { pointIndex: j },
+          resolved: true,
+          resolution: 'skip',
+        });
+        continue;
+      }
+      validRoute.push({
+        id: String(rp.id ?? `rp-${j}`),
+        locationId: rp.locationId ? String(rp.locationId) : null,
+        x: rp.x,
+        y: rp.y,
+        z: rp.z,
+        type: ['pickup', 'dropoff', 'waypoint', 'congestion'].includes(String(rp.type))
+          ? rp.type as RoutePoint['type']
+          : 'waypoint',
+        waitTime: typeof rp.waitTime === 'number' ? rp.waitTime : undefined,
+      });
+    }
+
+    if (validRoute.length < 2) {
+      conflicts.push({
+        type: 'invalid_route',
+        message: `方案 ${raw.planNo} 有效路线点不足 2 个，已跳过`,
+        planNo: String(raw.planNo),
+        details: { validPoints: validRoute.length },
+        resolved: true,
+        resolution: 'skip',
+      });
+      continue;
+    }
+
+    const validHotspots: CongestionHotspot[] = [];
+    if (Array.isArray(raw.hotspots)) {
+      for (const hsRaw of raw.hotspots as unknown[]) {
+        if (!hsRaw || typeof hsRaw !== 'object') continue;
+        const hs = hsRaw as Record<string, unknown>;
+        validHotspots.push({
+          id: String(hs.id ?? `hs-${Math.random().toString(36).slice(2, 8)}`),
+          zone: String(hs.zone ?? ''),
+          row: typeof hs.row === 'number' ? hs.row : 0,
+          col: typeof hs.col === 'number' ? hs.col : 0,
+          layer: typeof hs.layer === 'number' ? hs.layer : 0,
+          centerX: typeof hs.centerX === 'number' ? hs.centerX : 0,
+          centerY: typeof hs.centerY === 'number' ? hs.centerY : 0,
+          centerZ: typeof hs.centerZ === 'number' ? hs.centerZ : 0,
+          severity: typeof hs.severity === 'number' ? hs.severity : 0,
+          affectedLocationIds: Array.isArray(hs.affectedLocationIds)
+            ? (hs.affectedLocationIds as string[])
+            : [],
+          estimatedWaitTime: typeof hs.estimatedWaitTime === 'number' ? hs.estimatedWaitTime : 0,
+          throughput: typeof hs.throughput === 'number' ? hs.throughput : 0,
+        });
+      }
+    }
+
+    const validAffected: AffectedLocation[] = [];
+    if (Array.isArray(raw.affectedLocations)) {
+      for (const alRaw of raw.affectedLocations as unknown[]) {
+        if (!alRaw || typeof alRaw !== 'object') continue;
+        const al = alRaw as Record<string, unknown>;
+        validAffected.push({
+          locationId: String(al.locationId ?? ''),
+          beforeWaitTime: typeof al.beforeWaitTime === 'number' ? al.beforeWaitTime : 0,
+          afterWaitTime: typeof al.afterWaitTime === 'number' ? al.afterWaitTime : 0,
+          improvement: typeof al.improvement === 'number' ? al.improvement : 0,
+          locked: typeof al.locked === 'boolean' ? al.locked : false,
+        });
+      }
+    }
+
+    const rawMetrics = raw.metrics as Record<string, unknown> | undefined;
+    const metrics: CongestionPlan['metrics'] = {
+      totalWaitTimeBefore: typeof rawMetrics?.totalWaitTimeBefore === 'number' ? rawMetrics.totalWaitTimeBefore : 0,
+      totalWaitTimeAfter: typeof rawMetrics?.totalWaitTimeAfter === 'number' ? rawMetrics.totalWaitTimeAfter : 0,
+      avgWaitTimeBefore: typeof rawMetrics?.avgWaitTimeBefore === 'number' ? rawMetrics.avgWaitTimeBefore : 0,
+      avgWaitTimeAfter: typeof rawMetrics?.avgWaitTimeAfter === 'number' ? rawMetrics.avgWaitTimeAfter : 0,
+      maxWaitTimeBefore: typeof rawMetrics?.maxWaitTimeBefore === 'number' ? rawMetrics.maxWaitTimeBefore : 0,
+      maxWaitTimeAfter: typeof rawMetrics?.maxWaitTimeAfter === 'number' ? rawMetrics.maxWaitTimeAfter : 0,
+      totalHotspotsBefore: typeof rawMetrics?.totalHotspotsBefore === 'number' ? rawMetrics.totalHotspotsBefore : 0,
+      totalHotspotsAfter: typeof rawMetrics?.totalHotspotsAfter === 'number' ? rawMetrics.totalHotspotsAfter : 0,
+      affectedLocationsCount: typeof rawMetrics?.affectedLocationsCount === 'number' ? rawMetrics.affectedLocationsCount : 0,
+      improvedLocationsCount: typeof rawMetrics?.improvedLocationsCount === 'number' ? rawMetrics.improvedLocationsCount : 0,
+      estimatedThroughputGain: typeof rawMetrics?.estimatedThroughputGain === 'number' ? rawMetrics.estimatedThroughputGain : 0,
+      routeDistance: typeof rawMetrics?.routeDistance === 'number' ? rawMetrics.routeDistance : 0,
+    };
+
+    const plan: CongestionPlan = {
+      id: typeof raw.id === 'string' && raw.id ? raw.id : `imp-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+      planNo: String(raw.planNo),
+      name: String(raw.name ?? raw.planNo),
+      source: ['auto-generated', 'manual', 'imported', 'template'].includes(String(raw.source))
+        ? raw.source as PlanSource
+        : 'imported',
+      priority: ['critical', 'high', 'medium', 'low'].includes(String(raw.priority))
+        ? raw.priority as PlanPriority
+        : 'medium',
+      status: ['draft', 'reviewing', 'approved', 'rejected', 'archived'].includes(String(raw.status))
+        ? raw.status as PlanStatus
+        : 'draft',
+      createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : new Date().toISOString(),
+      updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date().toISOString(),
+      notes: typeof raw.notes === 'string' ? raw.notes : undefined,
+      route: validRoute,
+      hotspots: validHotspots,
+      affectedLocations: validAffected,
+      metrics,
+      lockedLocationIds: Array.isArray(raw.lockedLocationIds) ? (raw.lockedLocationIds as string[]) : [],
+      generationParams: typeof raw.generationParams === 'object' && raw.generationParams
+        ? (raw.generationParams as CongestionPlan['generationParams'])
+        : undefined,
+    };
+
+    plans.push(plan);
+  }
+
+  return { plans, conflicts, warnings };
+}
+
 export function buildSnapshotExportFileName(presetId?: string | null): string {
   const dateStr = new Date().toISOString().slice(0, 10);
   const timeStr = new Date().toISOString().slice(11, 19).replace(/:/g, '');
@@ -684,6 +1150,36 @@ interface WarehouseStore {
   ) => void;
   clearReplenishmentLogs: () => void;
   setAutoSaveEnabled: (enabled: boolean) => void;
+
+  congestion: CongestionSandboxState;
+  setCongestionFilter: (f: Partial<CongestionFilter>) => void;
+  detectCongestionHotspots: () => CongestionHotspot[];
+  generateCongestionPlans: (opts?: { count?: number; targetImprovement?: number }) => CongestionPlan[];
+  createCongestionPlan: (opts?: { name?: string; priority?: PlanPriority; source?: PlanSource }) => CongestionPlan | null;
+  updateCongestionPlan: (planId: string, updates: Partial<Omit<CongestionPlan, 'id' | 'createdAt'>>) => void;
+  deleteCongestionPlan: (planId: string) => void;
+  setActiveCongestionPlan: (planId: string | null) => void;
+  setCompareCongestionPlan: (planId: string | null) => void;
+  toggleCongestionComparison: () => void;
+  lockLocationInPlan: (planId: string, locationId: string) => void;
+  unlockLocationInPlan: (planId: string, locationId: string) => void;
+  adjustCongestionPlanPriority: (planId: string, priority: PlanPriority) => void;
+  exportCongestionPlans: () => void;
+  importCongestionPlans: (data: unknown) => CongestionImportResult;
+  undoLastCongestionAction: () => CongestionImportResult | null;
+  getCongestionUndoStackSize: () => number;
+  clearCongestionConflicts: () => void;
+  clearCongestionPlans: () => void;
+  saveCongestionDraft: () => void;
+  loadCongestionDraft: () => boolean;
+  getCongestionPlansInPriorityOrder: () => CongestionPlan[];
+  addCongestionActionLog: (
+    action: CongestionActionRecord['action'],
+    description: string,
+    details?: Record<string, unknown>
+  ) => void;
+  clearCongestionLogs: () => void;
+  setCongestionAutoSaveEnabled: (enabled: boolean) => void;
 }
 
 export const useWarehouseStore = create<WarehouseStore>()(
@@ -728,6 +1224,26 @@ export const useWarehouseStore = create<WarehouseStore>()(
         autoSaveEnabled: false,
         lastAutoSavedAt: null,
         importSession: null,
+      },
+      congestion: {
+        plans: [],
+        activePlanId: null,
+        comparePlanId: null,
+        filter: {
+          shift: 'all',
+          timeRange: null,
+          zones: [],
+          minCongestionLevel: 30,
+        },
+        selectedHotspotIds: [],
+        conflicts: [],
+        actionLogs: [],
+        undoStack: [],
+        nextPlanNo: 1,
+        autoSaveEnabled: true,
+        lastAutoSavedAt: null,
+        importSession: null,
+        showComparison: false,
       },
 
       setLocations: (locs) => {
@@ -2514,6 +3030,907 @@ export const useWarehouseStore = create<WarehouseStore>()(
         set((state) => ({
           replenishment: { ...state.replenishment, autoSaveEnabled: enabled },
         })),
+
+      setCongestionFilter: (f) =>
+        set((state) => ({
+          congestion: { ...state.congestion, filter: { ...state.congestion.filter, ...f } },
+        })),
+
+      detectCongestionHotspots: () => {
+        const state = get();
+        return detectCongestionHotspots(state.locations, state.pickRecords, state.congestion.filter);
+      },
+
+      generateCongestionPlans: (opts) => {
+        const state = get();
+        const count = opts?.count ?? 3;
+        const targetImprovement = opts?.targetImprovement ?? 40;
+
+        if (state.locations.length === 0) {
+          get().addCongestionActionLog(
+            'generate',
+            '生成疏导方案失败：无有效货位数据',
+            { reason: 'no_locations' }
+          );
+          return [];
+        }
+
+        const hotspots = detectCongestionHotspots(
+          state.locations,
+          state.pickRecords,
+          state.congestion.filter
+        );
+
+        if (hotspots.length === 0) {
+          get().addCongestionActionLog(
+            'generate',
+            '生成疏导方案失败：未检测到拥堵热区',
+            { reason: 'no_hotspots' }
+          );
+          return [];
+        }
+
+        const strategies: Array<'shortest' | 'balanced' | 'thorough'> = ['shortest', 'balanced', 'thorough'];
+        const improvementFactors = [0.3, 0.5, 0.7];
+        const newPlans: CongestionPlan[] = [];
+        const previousPlans = JSON.parse(JSON.stringify(state.congestion.plans));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        for (let i = 0; i < Math.min(count, 3); i++) {
+          const strategy = strategies[i % strategies.length];
+          const factor = improvementFactors[i % improvementFactors.length];
+          const route = generateRouteFromHotspots(hotspots, state.locations, strategy);
+          const affected = generateAffectedLocations(hotspots, state.locations, factor);
+          const metrics = computePlanMetrics(hotspots, route, affected);
+
+          const planNo = `CGS-${String(state.congestion.nextPlanNo + i).padStart(4, '0')}`;
+          const now = new Date().toISOString();
+
+          const strategyNames: Record<string, string> = {
+            shortest: '最短路径',
+            balanced: '均衡疏导',
+            thorough: '深度优化',
+          };
+
+          const plan: CongestionPlan = {
+            id: `plan-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+            planNo,
+            name: `${strategyNames[strategy]}方案 ${planNo}`,
+            source: 'auto-generated',
+            priority: metrics.estimatedThroughputGain >= 50 ? 'high' : metrics.estimatedThroughputGain >= 30 ? 'medium' : 'low',
+            status: 'draft',
+            createdAt: now,
+            updatedAt: now,
+            route,
+            hotspots,
+            affectedLocations: affected,
+            metrics,
+            lockedLocationIds: [],
+            generationParams: {
+              algorithm: strategy,
+              shift: state.congestion.filter.shift,
+              timeRange: state.congestion.filter.timeRange,
+              targetImprovement,
+            },
+          };
+
+          newPlans.push(plan);
+        }
+
+        const allPlans = [...state.congestion.plans, ...newPlans];
+        const maxNextNo = state.congestion.nextPlanNo + newPlans.length;
+
+        set((s) => ({
+          congestion: {
+            ...s.congestion,
+            plans: allPlans,
+            nextPlanNo: maxNextNo,
+            activePlanId: newPlans[0]?.id ?? null,
+            undoStack: [
+              {
+                actionId,
+                plans: previousPlans,
+                timestamp: new Date().toISOString(),
+                description: `撤销生成 ${newPlans.length} 个疏导方案`,
+              },
+              ...s.congestion.undoStack,
+            ].slice(0, 20),
+            lastAutoSavedAt: s.congestion.autoSaveEnabled ? new Date().toISOString() : s.congestion.lastAutoSavedAt,
+          },
+        }));
+
+        get().addCongestionActionLog(
+          'generate',
+          `自动生成 ${newPlans.length} 个疏导方案，共 ${hotspots.length} 个拥堵热区`,
+          {
+            planCount: newPlans.length,
+            hotspotCount: hotspots.length,
+            strategies: strategies.slice(0, newPlans.length),
+          }
+        );
+        get().addPlaybackLog(
+          'success',
+          `拥堵推演台: 已生成 ${newPlans.length} 个疏导方案`,
+          { planCount: newPlans.length, hotspotCount: hotspots.length }
+        );
+
+        if (state.congestion.autoSaveEnabled) {
+          get().saveCongestionDraft();
+        }
+
+        return newPlans;
+      },
+
+      createCongestionPlan: (opts) => {
+        const state = get();
+        const hotspots = detectCongestionHotspots(
+          state.locations,
+          state.pickRecords,
+          state.congestion.filter
+        );
+
+        if (hotspots.length === 0 && state.locations.length > 0) {
+          get().addCongestionActionLog(
+            'create',
+            '创建方案失败：无拥堵热区',
+            { reason: 'no_hotspots' }
+          );
+          return null;
+        }
+
+        const previousPlans = JSON.parse(JSON.stringify(state.congestion.plans));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const planNo = `CGS-${String(state.congestion.nextPlanNo).padStart(4, '0')}`;
+        const now = new Date().toISOString();
+
+        const route = hotspots.length > 0
+          ? generateRouteFromHotspots(hotspots, state.locations, 'balanced')
+          : [];
+        const affected = hotspots.length > 0
+          ? generateAffectedLocations(hotspots, state.locations, 0.5)
+          : [];
+        const metrics = computePlanMetrics(hotspots, route, affected);
+
+        const newPlan: CongestionPlan = {
+          id: `plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          planNo,
+          name: opts?.name ?? `手动方案 ${planNo}`,
+          source: opts?.source ?? 'manual',
+          priority: opts?.priority ?? 'medium',
+          status: 'draft',
+          createdAt: now,
+          updatedAt: now,
+          route,
+          hotspots,
+          affectedLocations: affected,
+          metrics,
+          lockedLocationIds: [],
+        };
+
+        set((s) => ({
+          congestion: {
+            ...s.congestion,
+            plans: [...s.congestion.plans, newPlan],
+            nextPlanNo: s.congestion.nextPlanNo + 1,
+            activePlanId: newPlan.id,
+            undoStack: [
+              {
+                actionId,
+                plans: previousPlans,
+                timestamp: now,
+                description: `撤销创建方案 ${planNo}`,
+              },
+              ...s.congestion.undoStack,
+            ].slice(0, 20),
+            lastAutoSavedAt: s.congestion.autoSaveEnabled ? now : s.congestion.lastAutoSavedAt,
+          },
+        }));
+
+        get().addCongestionActionLog(
+          'create',
+          `创建疏导方案 ${planNo}`,
+          { planId: newPlan.id, planNo, priority: newPlan.priority }
+        );
+
+        if (state.congestion.autoSaveEnabled) {
+          get().saveCongestionDraft();
+        }
+
+        return newPlan;
+      },
+
+      updateCongestionPlan: (planId, updates) => {
+        const state = get();
+        const previousPlans = JSON.parse(JSON.stringify(state.congestion.plans));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const plan = state.congestion.plans.find((p) => p.id === planId);
+        if (!plan) return;
+
+        set((s) => ({
+          congestion: {
+            ...s.congestion,
+            plans: s.congestion.plans.map((p) =>
+              p.id === planId
+                ? { ...p, ...updates, updatedAt: new Date().toISOString() }
+                : p
+            ),
+            undoStack: [
+              {
+                actionId,
+                plans: previousPlans,
+                timestamp: new Date().toISOString(),
+                description: `撤销更新方案 ${plan.planNo}`,
+              },
+              ...s.congestion.undoStack,
+            ].slice(0, 20),
+            lastAutoSavedAt: s.congestion.autoSaveEnabled ? new Date().toISOString() : s.congestion.lastAutoSavedAt,
+          },
+        }));
+
+        get().addCongestionActionLog(
+          'update',
+          `更新方案 ${plan.planNo}`,
+          { planId, planNo: plan.planNo, updatedFields: Object.keys(updates) }
+        );
+
+        if (state.congestion.autoSaveEnabled) {
+          get().saveCongestionDraft();
+        }
+      },
+
+      deleteCongestionPlan: (planId) => {
+        const state = get();
+        const plan = state.congestion.plans.find((p) => p.id === planId);
+        if (!plan) return;
+
+        const previousPlans = JSON.parse(JSON.stringify(state.congestion.plans));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        set((s) => ({
+          congestion: {
+            ...s.congestion,
+            plans: s.congestion.plans.filter((p) => p.id !== planId),
+            activePlanId: s.congestion.activePlanId === planId ? null : s.congestion.activePlanId,
+            comparePlanId: s.congestion.comparePlanId === planId ? null : s.congestion.comparePlanId,
+            undoStack: [
+              {
+                actionId,
+                plans: previousPlans,
+                timestamp: new Date().toISOString(),
+                description: `撤销删除方案 ${plan.planNo}`,
+              },
+              ...s.congestion.undoStack,
+            ].slice(0, 20),
+            lastAutoSavedAt: s.congestion.autoSaveEnabled ? new Date().toISOString() : s.congestion.lastAutoSavedAt,
+          },
+        }));
+
+        get().addCongestionActionLog(
+          'delete',
+          `删除方案 ${plan.planNo}（${plan.hotspots.length} 个热区）`,
+          { planId, planNo: plan.planNo, hotspotCount: plan.hotspots.length }
+        );
+
+        if (state.congestion.autoSaveEnabled) {
+          get().saveCongestionDraft();
+        }
+      },
+
+      setActiveCongestionPlan: (planId) =>
+        set((state) => ({
+          congestion: { ...state.congestion, activePlanId: planId },
+        })),
+
+      setCompareCongestionPlan: (planId) =>
+        set((state) => ({
+          congestion: { ...state.congestion, comparePlanId: planId },
+        })),
+
+      toggleCongestionComparison: () =>
+        set((state) => ({
+          congestion: { ...state.congestion, showComparison: !state.congestion.showComparison },
+        })),
+
+      lockLocationInPlan: (planId, locationId) => {
+        const state = get();
+        const plan = state.congestion.plans.find((p) => p.id === planId);
+        if (!plan) return;
+
+        const previousPlans = JSON.parse(JSON.stringify(state.congestion.plans));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        set((s) => ({
+          congestion: {
+            ...s.congestion,
+            plans: s.congestion.plans.map((p) =>
+              p.id === planId
+                ? {
+                    ...p,
+                    lockedLocationIds: [...p.lockedLocationIds, locationId],
+                    affectedLocations: p.affectedLocations.map((al) =>
+                      al.locationId === locationId ? { ...al, locked: true } : al
+                    ),
+                    updatedAt: new Date().toISOString(),
+                  }
+                : p
+            ),
+            undoStack: [
+              {
+                actionId,
+                plans: previousPlans,
+                timestamp: new Date().toISOString(),
+                description: `撤销锁定货位 ${locationId}`,
+              },
+              ...s.congestion.undoStack,
+            ].slice(0, 20),
+          },
+        }));
+
+        get().addCongestionActionLog(
+          'lock',
+          `方案 ${plan.planNo} 锁定货位 ${locationId}`,
+          { planId, locationId }
+        );
+      },
+
+      unlockLocationInPlan: (planId, locationId) => {
+        const state = get();
+        const plan = state.congestion.plans.find((p) => p.id === planId);
+        if (!plan) return;
+
+        const previousPlans = JSON.parse(JSON.stringify(state.congestion.plans));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        set((s) => ({
+          congestion: {
+            ...s.congestion,
+            plans: s.congestion.plans.map((p) =>
+              p.id === planId
+                ? {
+                    ...p,
+                    lockedLocationIds: p.lockedLocationIds.filter((id) => id !== locationId),
+                    affectedLocations: p.affectedLocations.map((al) =>
+                      al.locationId === locationId ? { ...al, locked: false } : al
+                    ),
+                    updatedAt: new Date().toISOString(),
+                  }
+                : p
+            ),
+            undoStack: [
+              {
+                actionId,
+                plans: previousPlans,
+                timestamp: new Date().toISOString(),
+                description: `撤销解锁货位 ${locationId}`,
+              },
+              ...s.congestion.undoStack,
+            ].slice(0, 20),
+          },
+        }));
+
+        get().addCongestionActionLog(
+          'unlock',
+          `方案 ${plan.planNo} 解锁货位 ${locationId}`,
+          { planId, locationId }
+        );
+      },
+
+      adjustCongestionPlanPriority: (planId, priority) => {
+        const state = get();
+        const plan = state.congestion.plans.find((p) => p.id === planId);
+        if (!plan) return;
+
+        const previousPlans = JSON.parse(JSON.stringify(state.congestion.plans));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        set((s) => ({
+          congestion: {
+            ...s.congestion,
+            plans: s.congestion.plans.map((p) =>
+              p.id === planId ? { ...p, priority, updatedAt: new Date().toISOString() } : p
+            ),
+            undoStack: [
+              {
+                actionId,
+                plans: previousPlans,
+                timestamp: new Date().toISOString(),
+                description: `撤销调整方案 ${plan.planNo} 优先级`,
+              },
+              ...s.congestion.undoStack,
+            ].slice(0, 20),
+          },
+        }));
+
+        get().addCongestionActionLog(
+          'adjust_priority',
+          `方案 ${plan.planNo} 优先级调整: ${plan.priority} → ${priority}`,
+          { planId, planNo: plan.planNo, oldPriority: plan.priority, newPriority: priority }
+        );
+      },
+
+      exportCongestionPlans: () => {
+        const state = get();
+        const plans = state.congestion.plans;
+
+        const statusBreakdown: Record<PlanStatus, number> = {
+          draft: 0, reviewing: 0, approved: 0, rejected: 0, archived: 0,
+        };
+        const priorityBreakdown: Record<PlanPriority, number> = {
+          critical: 0, high: 0, medium: 0, low: 0,
+        };
+        let totalHotspots = 0;
+        let totalAffected = 0;
+
+        for (const p of plans) {
+          statusBreakdown[p.status]++;
+          priorityBreakdown[p.priority]++;
+          totalHotspots += p.hotspots.length;
+          totalAffected += p.affectedLocations.length;
+        }
+
+        const exportData: CongestionExportData = {
+          version: 1,
+          exportedAt: new Date().toISOString(),
+          plans,
+          summary: {
+            totalPlans: plans.length,
+            statusBreakdown,
+            priorityBreakdown,
+            totalHotspots,
+            totalAffectedLocations: totalAffected,
+          },
+        };
+
+        const fileName = `congestion-plans-${new Date().toISOString().slice(0, 10)}-${new Date().toISOString().slice(11, 19).replace(/:/g, '')}.json`;
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], {
+          type: 'application/json',
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        get().addCongestionActionLog(
+          'update',
+          `已导出 ${plans.length} 个疏导方案到 ${fileName}`,
+          { fileName, planCount: plans.length }
+        );
+        get().addPlaybackLog(
+          'success',
+          `拥堵疏导方案已导出: ${fileName}（${plans.length} 个方案）`,
+          { fileName, planCount: plans.length }
+        );
+      },
+
+      importCongestionPlans: (data) => {
+        const state = get();
+        const now = new Date().toISOString();
+        const previousPlans = JSON.parse(JSON.stringify(state.congestion.plans));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const conflicts: CongestionConflict[] = [];
+        const warnings: string[] = [];
+
+        try {
+          if (!data || typeof data !== 'object') {
+            return {
+              success: false,
+              importedPlans: 0,
+              skippedPlans: 0,
+              conflicts: [{
+                type: 'missing_required_field',
+                message: '导入数据格式无效',
+                resolved: false,
+              }],
+              warnings: ['数据不是有效的 JSON 对象'],
+              canUndo: false,
+            };
+          }
+
+          const obj = data as Record<string, unknown>;
+          const { plans: importedPlans, conflicts: validationConflicts, warnings: validationWarnings } =
+            validateAndNormalizeCongestionData(obj);
+
+          conflicts.push(...validationConflicts);
+          warnings.push(...validationWarnings);
+
+          const existingPlanNos = new Set(state.congestion.plans.map((p) => p.planNo));
+          const existingPlanNames = new Set(state.congestion.plans.map((p) => p.name));
+          const validLocationIds = new Set(state.locations.map((l) => l.id));
+          const finalPlans: CongestionPlan[] = [];
+          let imported = 0;
+          let skipped = 0;
+          let maxNextPlanNo = state.congestion.nextPlanNo;
+
+          for (const plan of importedPlans) {
+            let planNo = plan.planNo;
+            if (existingPlanNos.has(planNo)) {
+              const oldNo = planNo;
+              let suffix = 2;
+              while (existingPlanNos.has(`${planNo}-(${suffix})`)) {
+                suffix++;
+              }
+              planNo = `${planNo}-(${suffix})`;
+              conflicts.push({
+                type: 'duplicate_plan_no',
+                message: `方案编号 ${oldNo} 重复，已自动重命名为 ${planNo}`,
+                planNo,
+                details: { originalPlanNo: oldNo, renamedPlanNo: planNo },
+                resolved: true,
+                resolution: 'rename',
+              });
+              warnings.push(`方案编号重复: ${oldNo} → ${planNo}`);
+            }
+
+            let planName = plan.name;
+            if (existingPlanNames.has(planName)) {
+              const oldName = planName;
+              let suffix = 2;
+              while (existingPlanNames.has(`${oldName} (${suffix})`)) {
+                suffix++;
+              }
+              planName = `${oldName} (${suffix})`;
+              conflicts.push({
+                type: 'duplicate_plan_name',
+                message: `方案名称 ${oldName} 重复，已自动重命名为 ${planName}`,
+                planNo,
+                details: { originalName: oldName, renamedName: planName },
+                resolved: true,
+                resolution: 'rename',
+              });
+            }
+
+            const validAffected: AffectedLocation[] = [];
+            const unknownLocs: string[] = [];
+            for (const al of plan.affectedLocations) {
+              if (!validLocationIds.has(al.locationId)) {
+                unknownLocs.push(al.locationId);
+                conflicts.push({
+                  type: 'unknown_location',
+                  message: `方案 ${planNo} 包含未知货位 ${al.locationId}，已跳过`,
+                  planNo,
+                  locationId: al.locationId,
+                  details: { locationId: al.locationId },
+                  resolved: true,
+                  resolution: 'skip',
+                });
+                continue;
+              }
+              validAffected.push(al);
+            }
+
+            if (validAffected.length === 0 && plan.affectedLocations.length > 0) {
+              conflicts.push({
+                type: 'missing_required_field',
+                message: `方案 ${planNo} 无有效受影响货位，已跳过`,
+                planNo,
+                details: { reason: 'no_valid_locations', unknownCount: unknownLocs.length },
+                resolved: true,
+                resolution: 'skip',
+              });
+              skipped++;
+              continue;
+            }
+
+            const finalPlan: CongestionPlan = {
+              ...plan,
+              planNo,
+              name: planName,
+              affectedLocations: validAffected,
+              source: 'imported',
+              createdAt: plan.createdAt || now,
+              updatedAt: now,
+            };
+
+            finalPlans.push(finalPlan);
+            existingPlanNos.add(planNo);
+            existingPlanNames.add(planName);
+            imported++;
+
+            const noMatch = planNo.match(/CGS-(\d+)/);
+            if (noMatch) {
+              const n = parseInt(noMatch[1], 10) + 1;
+              if (n > maxNextPlanNo) maxNextPlanNo = n;
+            }
+          }
+
+          const allPlans = [...state.congestion.plans, ...finalPlans];
+
+          set((s) => ({
+            congestion: {
+              ...s.congestion,
+              plans: allPlans,
+              conflicts: [...s.congestion.conflicts, ...conflicts],
+              nextPlanNo: maxNextPlanNo,
+              undoStack: [
+                {
+                  actionId,
+                  plans: previousPlans,
+                  timestamp: now,
+                  description: `撤销导入疏导方案（${imported} 个）`,
+                },
+                ...s.congestion.undoStack,
+              ].slice(0, 20),
+              importSession: {
+                previousPlans,
+                actionId,
+              },
+              lastAutoSavedAt: s.congestion.autoSaveEnabled ? now : s.congestion.lastAutoSavedAt,
+            },
+          }));
+
+          get().addCongestionActionLog(
+            'import',
+            `导入疏导方案完成: 成功 ${imported} 个，跳过 ${skipped} 个，冲突 ${conflicts.length} 条`,
+            { imported, skipped, conflictCount: conflicts.length, actionId }
+          );
+          get().addPlaybackLog(
+            conflicts.length > 0 ? 'warning' : 'success',
+            `拥堵方案导入: 成功 ${imported} 个，跳过 ${skipped} 个，冲突 ${conflicts.length} 条，可撤销`,
+            { imported, skipped, conflictCount: conflicts.length }
+          );
+
+          if (state.congestion.autoSaveEnabled) {
+            get().saveCongestionDraft();
+          }
+
+          return {
+            success: true,
+            importedPlans: imported,
+            skippedPlans: skipped,
+            conflicts,
+            warnings,
+            canUndo: true,
+            actionId,
+          };
+        } catch (err) {
+          console.error('拥堵方案导入异常:', err);
+          get().addPlaybackLog(
+            'error',
+            `拥堵方案导入失败: ${(err as Error).message}`,
+            { error: (err as Error).message }
+          );
+          return {
+            success: false,
+            importedPlans: 0,
+            skippedPlans: 0,
+            conflicts: [...conflicts, {
+              type: 'missing_required_field',
+              message: `导入异常: ${(err as Error).message}`,
+              resolved: false,
+            }],
+            warnings: [...warnings, `异常: ${(err as Error).message}`],
+            canUndo: false,
+          };
+        }
+      },
+
+      undoLastCongestionAction: () => {
+        const state = get();
+        if (state.congestion.undoStack.length === 0) {
+          get().addPlaybackLog('warning', '撤销失败: 拥堵推演台撤销栈为空');
+          return null;
+        }
+
+        const undoItem = state.congestion.undoStack[0];
+        const previousPlans = undoItem.plans;
+
+        set((s) => ({
+          congestion: {
+            ...s.congestion,
+            plans: previousPlans,
+            undoStack: s.congestion.undoStack.slice(1),
+            importSession: null,
+            lastAutoSavedAt: s.congestion.autoSaveEnabled ? new Date().toISOString() : s.congestion.lastAutoSavedAt,
+          },
+        }));
+
+        get().addCongestionActionLog(
+          'update',
+          `已撤销: ${undoItem.description}`,
+          { actionId: undoItem.actionId }
+        );
+        get().addPlaybackLog(
+          'success',
+          `拥堵推演台: ${undoItem.description}`,
+          { actionId: undoItem.actionId }
+        );
+
+        if (state.congestion.autoSaveEnabled) {
+          get().saveCongestionDraft();
+        }
+
+        return {
+          success: true,
+          importedPlans: 0,
+          skippedPlans: 0,
+          conflicts: [],
+          warnings: [],
+          canUndo: state.congestion.undoStack.length > 1,
+        };
+      },
+
+      getCongestionUndoStackSize: () => get().congestion.undoStack.length,
+
+      clearCongestionConflicts: () =>
+        set((state) => ({
+          congestion: { ...state.congestion, conflicts: [] },
+        })),
+
+      clearCongestionPlans: () => {
+        const state = get();
+        const previousPlans = JSON.parse(JSON.stringify(state.congestion.plans));
+        const actionId = `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        set((s) => ({
+          congestion: {
+            ...s.congestion,
+            plans: [],
+            activePlanId: null,
+            comparePlanId: null,
+            nextPlanNo: 1,
+            undoStack: [
+              {
+                actionId,
+                plans: previousPlans,
+                timestamp: new Date().toISOString(),
+                description: `撤销清空全部方案（${previousPlans.length} 个）`,
+              },
+              ...s.congestion.undoStack,
+            ].slice(0, 20),
+            showComparison: false,
+          },
+        }));
+
+        get().addCongestionActionLog(
+          'delete',
+          `清空全部 ${previousPlans.length} 个疏导方案`,
+          { clearedCount: previousPlans.length }
+        );
+
+        if (state.congestion.autoSaveEnabled) {
+          get().saveCongestionDraft();
+        }
+      },
+
+      saveCongestionDraft: () => {
+        try {
+          const state = get();
+          const draft = {
+            version: 1 as const,
+            savedAt: new Date().toISOString(),
+            plans: state.congestion.plans,
+            nextPlanNo: state.congestion.nextPlanNo,
+            filter: state.congestion.filter,
+            activePlanId: state.congestion.activePlanId,
+            showComparison: state.congestion.showComparison,
+            comparePlanId: state.congestion.comparePlanId,
+          };
+          localStorage.setItem('congestion-draft', JSON.stringify(draft));
+          set((s) => ({
+            congestion: { ...s.congestion, lastAutoSavedAt: new Date().toISOString() },
+          }));
+        } catch (err) {
+          console.error('保存拥堵草稿失败:', err);
+          get().addPlaybackLog(
+            'error',
+            `保存拥堵草稿失败: ${(err as Error).message}`,
+            { error: (err as Error).message }
+          );
+        }
+      },
+
+      loadCongestionDraft: () => {
+        try {
+          const raw = localStorage.getItem('congestion-draft');
+          if (!raw) return false;
+          const parsed = JSON.parse(raw);
+          if (!parsed || typeof parsed !== 'object') return false;
+
+          const conflicts: CongestionConflict[] = [];
+          if (parsed.version !== 1) {
+            conflicts.push({
+              type: 'version_mismatch',
+              message: `草稿版本 ${parsed.version} 与当前版本 1 不匹配，尝试恢复`,
+              details: { draftVersion: parsed.version },
+              resolved: true,
+              resolution: 'merge',
+            });
+          }
+
+          const plans = Array.isArray(parsed.plans) ? parsed.plans : [];
+          const nextPlanNo = typeof parsed.nextPlanNo === 'number' ? parsed.nextPlanNo : 1;
+          const filter = parsed.filter && typeof parsed.filter === 'object'
+            ? {
+                shift: ['morning', 'afternoon', 'night', 'all'].includes(parsed.filter.shift)
+                  ? parsed.filter.shift as ShiftType
+                  : 'all',
+                timeRange: parsed.filter.timeRange || null,
+                zones: Array.isArray(parsed.filter.zones) ? parsed.filter.zones : [],
+                minCongestionLevel: typeof parsed.filter.minCongestionLevel === 'number'
+                  ? parsed.filter.minCongestionLevel
+                  : 30,
+              }
+            : undefined;
+
+          set((state) => ({
+            congestion: {
+              ...state.congestion,
+              plans,
+              nextPlanNo,
+              conflicts: [...state.congestion.conflicts, ...conflicts],
+              lastAutoSavedAt: typeof parsed.savedAt === 'string' ? parsed.savedAt : null,
+              activePlanId: typeof parsed.activePlanId === 'string' ? parsed.activePlanId : null,
+              comparePlanId: typeof parsed.comparePlanId === 'string' ? parsed.comparePlanId : null,
+              showComparison: typeof parsed.showComparison === 'boolean' ? parsed.showComparison : false,
+              filter: filter ? { ...state.congestion.filter, ...filter } : state.congestion.filter,
+            },
+          }));
+
+          if (plans.length > 0) {
+            get().addCongestionActionLog(
+              'import',
+              `从本地草稿恢复 ${plans.length} 个疏导方案`,
+              { draftSavedAt: parsed.savedAt, planCount: plans.length }
+            );
+            get().addPlaybackLog(
+              'info',
+              `拥堵推演台: 已从本地草稿恢复 ${plans.length} 个方案`,
+              { planCount: plans.length }
+            );
+          }
+          return true;
+        } catch (err) {
+          console.error('加载拥堵草稿失败:', err);
+          return false;
+        }
+      },
+
+      getCongestionPlansInPriorityOrder: () => {
+        const state = get();
+        const priorityOrder: Record<PlanPriority, number> = {
+          critical: 0,
+          high: 1,
+          medium: 2,
+          low: 3,
+        };
+        return [...state.congestion.plans].sort((a, b) => {
+          if (priorityOrder[a.priority] !== priorityOrder[b.priority]) {
+            return priorityOrder[a.priority] - priorityOrder[b.priority];
+          }
+          if (a.metrics.estimatedThroughputGain !== b.metrics.estimatedThroughputGain) {
+            return b.metrics.estimatedThroughputGain - a.metrics.estimatedThroughputGain;
+          }
+          return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+        });
+      },
+
+      addCongestionActionLog: (action, description, details) => {
+        const record: CongestionActionRecord = {
+          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          action,
+          description,
+          details,
+        };
+        set((state) => ({
+          congestion: {
+            ...state.congestion,
+            actionLogs: [record, ...state.congestion.actionLogs].slice(0, 100),
+          },
+        }));
+      },
+
+      clearCongestionLogs: () =>
+        set((state) => ({
+          congestion: { ...state.congestion, actionLogs: [] },
+        })),
+
+      setCongestionAutoSaveEnabled: (enabled) =>
+        set((state) => ({
+          congestion: { ...state.congestion, autoSaveEnabled: enabled },
+        })),
     }),
     {
       name: 'warehouse-heatmap-store',
@@ -2554,6 +3971,21 @@ export const useWarehouseStore = create<WarehouseStore>()(
           autoSaveEnabled: state.replenishment.autoSaveEnabled,
           lastAutoSavedAt: state.replenishment.lastAutoSavedAt,
           importSession: null,
+        },
+        congestion: {
+          plans: state.congestion.plans,
+          activePlanId: state.congestion.activePlanId,
+          comparePlanId: state.congestion.comparePlanId,
+          filter: state.congestion.filter,
+          selectedHotspotIds: [],
+          conflicts: state.congestion.conflicts,
+          actionLogs: [],
+          undoStack: state.congestion.undoStack.slice(0, 5),
+          nextPlanNo: state.congestion.nextPlanNo,
+          autoSaveEnabled: state.congestion.autoSaveEnabled,
+          lastAutoSavedAt: state.congestion.lastAutoSavedAt,
+          importSession: null,
+          showComparison: state.congestion.showComparison,
         },
       }),
       onRehydrateStorage: () => (state) => {
@@ -2602,6 +4034,48 @@ export const useWarehouseStore = create<WarehouseStore>()(
             lastAutoSavedAt: null,
             importSession: null,
           };
+        }
+        if (state && !state.congestion) {
+          state.congestion = {
+            plans: [],
+            activePlanId: null,
+            comparePlanId: null,
+            filter: {
+              shift: 'all',
+              timeRange: null,
+              zones: [],
+              minCongestionLevel: 30,
+            },
+            selectedHotspotIds: [],
+            conflicts: [],
+            actionLogs: [],
+            undoStack: [],
+            nextPlanNo: 1,
+            autoSaveEnabled: true,
+            lastAutoSavedAt: null,
+            importSession: null,
+            showComparison: false,
+          };
+        }
+        if (state?.congestion && typeof state.congestion === 'object') {
+          const c = state.congestion as unknown as Record<string, unknown>;
+          if (!Array.isArray(c.plans)) c.plans = [];
+          if (!c.filter || typeof c.filter !== 'object') {
+            c.filter = { shift: 'all', timeRange: null, zones: [], minCongestionLevel: 30 };
+          }
+          const f = c.filter as Record<string, unknown>;
+          if (!f.shift || !['all', 'morning', 'afternoon', 'night'].includes(f.shift as string)) {
+            f.shift = 'all';
+          }
+          if (typeof f.minCongestionLevel !== 'number' || f.minCongestionLevel < 0 || f.minCongestionLevel > 100) {
+            f.minCongestionLevel = 30;
+          }
+          if (!Array.isArray(f.zones)) f.zones = [];
+          if (!Array.isArray(c.conflicts)) c.conflicts = [];
+          if (!Array.isArray(c.undoStack)) c.undoStack = [];
+          if (typeof c.nextPlanNo !== 'number' || c.nextPlanNo < 1) c.nextPlanNo = 1;
+          if (typeof c.autoSaveEnabled !== 'boolean') c.autoSaveEnabled = true;
+          if (typeof c.showComparison !== 'boolean') c.showComparison = false;
         }
       },
     }
